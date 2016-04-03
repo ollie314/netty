@@ -96,6 +96,20 @@ public class DefaultHttp2ConnectionTest {
         server = new DefaultHttp2Connection(true);
         client = new DefaultHttp2Connection(false);
         client.addListener(clientListener);
+        doAnswer(new Answer<Void>() {
+            @Override
+            public Void answer(InvocationOnMock invocation) throws Throwable {
+                assertNotNull(client.stream(invocation.getArgumentAt(0, Http2Stream.class).id()));
+                return null;
+            }
+        }).when(clientListener).onStreamClosed(any(Http2Stream.class));
+        doAnswer(new Answer<Void>() {
+            @Override
+            public Void answer(InvocationOnMock invocation) throws Throwable {
+                assertNull(client.stream(invocation.getArgumentAt(0, Http2Stream.class).id()));
+                return null;
+            }
+        }).when(clientListener).onStreamRemoved(any(Http2Stream.class));
     }
 
     @Test
@@ -205,6 +219,22 @@ public class DefaultHttp2ConnectionTest {
             });
         }
         assertTrue(latch.await(2, TimeUnit.SECONDS));
+    }
+
+    @Test
+    public void closeWhileIteratingDoesNotNPE() throws Http2Exception {
+        final Http2Stream streamA = client.local().createStream(3, false);
+        final Http2Stream streamB = client.local().createStream(5, false);
+        final Http2Stream streamC = client.local().createStream(7, false);
+        streamB.setPriority(streamA.id(), Http2CodecUtil.DEFAULT_PRIORITY_WEIGHT, false);
+        client.forEachActiveStream(new Http2StreamVisitor() {
+            @Override
+            public boolean visit(Http2Stream stream) throws Http2Exception {
+                streamA.close();
+                streamB.setPriority(streamC.id(), Http2CodecUtil.DEFAULT_PRIORITY_WEIGHT, false);
+                return true;
+            }
+        });
     }
 
     @Test

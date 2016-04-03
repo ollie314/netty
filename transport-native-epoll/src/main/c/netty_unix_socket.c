@@ -296,7 +296,12 @@ static jobject _recvFrom(JNIEnv* env, jint fd, void* buffer, jint pos, jint limi
 int netty_unix_socket_getOption(JNIEnv* env, jint fd, int level, int optname, void* optval, socklen_t optlen) {
     int rc = getsockopt(fd, level, optname, optval, &optlen);
     if (rc < 0) {
-        netty_unix_errors_throwChannelExceptionErrorNo(env, "getsockopt() failed: ", errno);
+        int err = errno;
+        if (err == EBADF) {
+            netty_unix_errors_throwClosedChannelException(env);
+        } else {
+            netty_unix_errors_throwChannelExceptionErrorNo(env, "getsockopt() failed: ", err);
+        }
     }
     return rc;
 }
@@ -304,7 +309,12 @@ int netty_unix_socket_getOption(JNIEnv* env, jint fd, int level, int optname, vo
 int netty_unix_socket_setOption(JNIEnv* env, jint fd, int level, int optname, const void* optval, socklen_t len) {
     int rc = setsockopt(fd, level, optname, optval, len);
     if (rc < 0) {
-        netty_unix_errors_throwChannelExceptionErrorNo(env, "setsockopt() failed: ", errno);
+        int err = errno;
+        if (err == EBADF) {
+            netty_unix_errors_throwClosedChannelException(env);
+        } else {
+            netty_unix_errors_throwChannelExceptionErrorNo(env, "setsockopt() failed: ", err);
+        }
     }
     return rc;
 }
@@ -582,6 +592,14 @@ static void netty_unix_socket_setSoLinger(JNIEnv* env, jclass clazz, jint fd, ji
     netty_unix_socket_setOption(env, fd, SOL_SOCKET, SO_LINGER, &solinger, sizeof(solinger));
 }
 
+static void netty_unix_socket_setTcpDeferAccept(JNIEnv* env, jclass clazz, jint fd, jint optval) {
+    netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &optval, sizeof(optval));
+}
+
+static void netty_unix_socket_setTcpQuickAck(JNIEnv* env, jclass clazz, jint fd, jint optval) {
+    netty_unix_socket_setOption(env, fd, IPPROTO_TCP, TCP_QUICKACK, &optval, sizeof(optval));
+}
+
 static jint netty_unix_socket_isKeepAlive(JNIEnv* env, jclass clazz, jint fd) {
     int optval;
     if (netty_unix_socket_getOption(env, fd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval)) == -1) {
@@ -641,6 +659,22 @@ static jint netty_unix_socket_getSoError(JNIEnv* env, jclass clazz, jint fd) {
     }
     return optval;
 }
+
+static jint netty_unix_socket_getTcpDeferAccept(JNIEnv* env, jclass clazz, jint fd) {
+    int optval;
+    if (netty_unix_socket_getOption(env, fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &optval, sizeof(optval)) == -1) {
+        return -1;
+    }
+    return optval;
+}
+
+static jint netty_unix_socket_isTcpQuickAck(JNIEnv* env, jclass clazz, jint fd) {
+    int optval;
+    if (netty_unix_socket_getOption(env, fd, IPPROTO_TCP, TCP_QUICKACK, &optval, sizeof(optval)) == -1) {
+        return -1;
+    }
+    return optval;
+}
 // JNI Registered Methods End
 
 // JNI Method Registration Table Begin
@@ -669,13 +703,17 @@ static const JNINativeMethod fixed_method_table[] = {
   { "setKeepAlive", "(II)V", (void *) netty_unix_socket_setKeepAlive },
   { "setTcpCork", "(II)V", (void *) netty_unix_socket_setTcpCork },
   { "setSoLinger", "(II)V", (void *) netty_unix_socket_setSoLinger },
+  { "setTcpDeferAccept", "(II)V", (void *) netty_unix_socket_setTcpDeferAccept },
+  { "setTcpQuickAck", "(II)V", (void *) netty_unix_socket_setTcpQuickAck },
   { "isKeepAlive", "(I)I", (void *) netty_unix_socket_isKeepAlive },
   { "isTcpNoDelay", "(I)I", (void *) netty_unix_socket_isTcpNoDelay },
   { "getReceiveBufferSize", "(I)I", (void *) netty_unix_socket_getReceiveBufferSize },
   { "getSendBufferSize", "(I)I", (void *) netty_unix_socket_getSendBufferSize },
   { "isTcpCork", "(I)I", (void *) netty_unix_socket_isTcpCork },
   { "getSoLinger", "(I)I", (void *) netty_unix_socket_getSoLinger },
-  { "getSoError", "(I)I", (void *) netty_unix_socket_getSoError }
+  { "getSoError", "(I)I", (void *) netty_unix_socket_getSoError },
+  { "getTcpDeferAccept", "(I)I", (void *) netty_unix_socket_getTcpDeferAccept },
+  { "isTcpQuickAck", "(I)I", (void *) netty_unix_socket_isTcpQuickAck }
 };
 static const jint fixed_method_table_size = sizeof(fixed_method_table) / sizeof(fixed_method_table[0]);
 

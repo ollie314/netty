@@ -22,7 +22,6 @@ import io.netty.channel.ChannelOutboundBuffer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.EventLoop;
-import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.ServerChannel;
 import io.netty.channel.unix.FileDescriptor;
 import io.netty.channel.unix.Socket;
@@ -36,6 +35,7 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
     /**
      * @deprecated Use {@link #AbstractEpollServerChannel(Socket, boolean)}.
      */
+    @Deprecated
     protected AbstractEpollServerChannel(int fd) {
         this(new Socket(fd), false);
     }
@@ -53,7 +53,7 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
      */
     @Deprecated
     protected AbstractEpollServerChannel(Socket fd) {
-        this(fd, fd.getSoError() == 0);
+        this(fd, isSoErrorZero(fd));
     }
 
     protected AbstractEpollServerChannel(Socket fd, boolean active) {
@@ -105,43 +105,37 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
         }
 
         @Override
-        protected EpollRecvByteAllocatorHandle newEpollHandle(RecvByteBufAllocator.Handle handle) {
-            return new EpollRecvByteAllocatorMessageHandle(handle, isFlagSet(Native.EPOLLET));
-        }
-
-        @Override
         void epollInReady() {
             assert eventLoop().inEventLoop();
-            if (fd().isInputShutdown()) {
-                return;
-            }
-            boolean edgeTriggered = isFlagSet(Native.EPOLLET);
-
             final ChannelConfig config = config();
-            if (!readPending && !edgeTriggered && !config.isAutoRead()) {
+            if (!readPending && !config.isAutoRead() || fd().isInputShutdown()) {
                 // ChannelConfig.setAutoRead(false) was called in the meantime
                 clearEpollIn0();
                 return;
             }
+            final EpollRecvByteAllocatorHandle allocHandle = recvBufAllocHandle();
+            allocHandle.edgeTriggered(isFlagSet(Native.EPOLLET));
 
             final ChannelPipeline pipeline = pipeline();
-            final EpollRecvByteAllocatorHandle allocHandle = recvBufAllocHandle();
             allocHandle.reset(config);
 
             Throwable exception = null;
             try {
                 try {
                     do {
-                        int socketFd = fd().accept(acceptedAddress);
-                        if (socketFd == -1) {
+                        // lastBytesRead represents the fd. We use lastBytesRead because it must be set so that the
+                        // EpollRecvByteAllocatorHandle knows if it should try to read again or not when autoRead is
+                        // enabled.
+                        epollInReadAttempted();
+                        allocHandle.lastBytesRead(fd().accept(acceptedAddress));
+                        if (allocHandle.lastBytesRead() == -1) {
                             // this means everything was handled for now
                             break;
                         }
-                        readPending = false;
                         allocHandle.incMessagesRead(1);
 
                         int len = acceptedAddress[0];
-                        pipeline.fireChannelRead(newChildChannel(socketFd, acceptedAddress, 1, len));
+                        pipeline.fireChannelRead(newChildChannel(allocHandle.lastBytesRead(), acceptedAddress, 1, len));
                     } while (allocHandle.continueReading());
                 } catch (Throwable t) {
                     exception = t;
@@ -151,18 +145,9 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
 
                 if (exception != null) {
                     pipeline.fireExceptionCaught(exception);
-                    checkResetEpollIn(edgeTriggered);
                 }
             } finally {
-                // Check if there is a readPending which was not processed yet.
-                // This could be for two reasons:
-                // * The user called Channel.read() or ChannelHandlerContext.read() in channelRead(...) method
-                // * The user called Channel.read() or ChannelHandlerContext.read() in channelReadComplete(...) method
-                //
-                // See https://github.com/netty/netty/issues/2254
-                if (!readPending && !config.isAutoRead()) {
-                    clearEpollIn0();
-                }
+                epollInFinally(config);
             }
         }
     }

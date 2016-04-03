@@ -26,7 +26,6 @@ import io.netty.channel.ChannelOutboundBuffer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.DefaultAddressedEnvelope;
-import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.socket.DatagramChannel;
 import io.netty.channel.socket.DatagramChannelConfig;
 import io.netty.channel.socket.DatagramPacket;
@@ -501,6 +500,9 @@ public final class EpollDatagramChannel extends AbstractEpollChannel implements 
                     EpollDatagramChannel.this.local = fd().localAddress();
                     success = true;
 
+                    // First notify the promise before notifying the handler.
+                    channelPromise.trySuccess();
+
                     // Regardless if the connection attempt was cancelled, channelActive() event should be triggered,
                     // because what happened is what happened.
                     if (!wasActive && isActive()) {
@@ -510,38 +512,28 @@ public final class EpollDatagramChannel extends AbstractEpollChannel implements 
                     if (!success) {
                         doClose();
                     } else {
-                        channelPromise.setSuccess();
                         connected = true;
                     }
                 }
             } catch (Throwable cause) {
-                channelPromise.setFailure(cause);
+                channelPromise.tryFailure(cause);
             }
-        }
-
-        @Override
-        protected EpollRecvByteAllocatorHandle newEpollHandle(RecvByteBufAllocator.Handle handle) {
-            return new EpollRecvByteAllocatorMessageHandle(handle, isFlagSet(Native.EPOLLET));
         }
 
         @Override
         void epollInReady() {
             assert eventLoop().inEventLoop();
-            if (fd().isInputShutdown()) {
-                return;
-            }
             DatagramChannelConfig config = config();
-            boolean edgeTriggered = isFlagSet(Native.EPOLLET);
-
-            if (!readPending && !edgeTriggered && !config.isAutoRead()) {
+            if (!readPending && !config.isAutoRead() || fd().isInputShutdown()) {
                 // ChannelConfig.setAutoRead(false) was called in the meantime
                 clearEpollIn0();
                 return;
             }
+            final EpollRecvByteAllocatorHandle allocHandle = recvBufAllocHandle();
+            allocHandle.edgeTriggered(isFlagSet(Native.EPOLLET));
 
             final ChannelPipeline pipeline = pipeline();
             final ByteBufAllocator allocator = config.getAllocator();
-            final EpollRecvByteAllocatorHandle allocHandle = recvBufAllocHandle();
             allocHandle.reset(config);
 
             Throwable exception = null;
@@ -552,6 +544,7 @@ public final class EpollDatagramChannel extends AbstractEpollChannel implements 
                         data = allocHandle.allocate(allocator);
                         allocHandle.attemptedBytesRead(data.writableBytes());
                         final DatagramSocketAddress remoteAddress;
+                        epollInReadAttempted();
                         if (data.hasMemoryAddress()) {
                             // has a memory address so use optimized call
                             remoteAddress = fd().recvFromAddress(data.memoryAddress(), data.writerIndex(),
@@ -562,6 +555,7 @@ public final class EpollDatagramChannel extends AbstractEpollChannel implements 
                         }
 
                         if (remoteAddress == null) {
+                            allocHandle.lastBytesRead(-1);
                             data.release();
                             data = null;
                             break;
@@ -570,7 +564,6 @@ public final class EpollDatagramChannel extends AbstractEpollChannel implements 
                         allocHandle.incMessagesRead(1);
                         allocHandle.lastBytesRead(remoteAddress.receivedAmount());
                         data.writerIndex(data.writerIndex() + allocHandle.lastBytesRead());
-                        readPending = false;
 
                         readBuf.add(new DatagramPacket(data, (InetSocketAddress) localAddress(), remoteAddress));
                         data = null;
@@ -578,7 +571,6 @@ public final class EpollDatagramChannel extends AbstractEpollChannel implements 
                 } catch (Throwable t) {
                     if (data != null) {
                         data.release();
-                        data = null;
                     }
                     exception = t;
                 }
@@ -593,18 +585,9 @@ public final class EpollDatagramChannel extends AbstractEpollChannel implements 
 
                 if (exception != null) {
                     pipeline.fireExceptionCaught(exception);
-                    checkResetEpollIn(edgeTriggered);
                 }
             } finally {
-                // Check if there is a readPending which was not processed yet.
-                // This could be for two reasons:
-                // * The user called Channel.read() or ChannelHandlerContext.read() in channelRead(...) method
-                // * The user called Channel.read() or ChannelHandlerContext.read() in channelReadComplete(...) method
-                //
-                // See https://github.com/netty/netty/issues/2254
-                if (!readPending && !config.isAutoRead()) {
-                    clearEpollIn();
-                }
+                epollInFinally(config);
             }
         }
     }

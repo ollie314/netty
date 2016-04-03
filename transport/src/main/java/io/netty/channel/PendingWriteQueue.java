@@ -17,6 +17,7 @@ package io.netty.channel;
 
 import io.netty.util.Recycler;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.PromiseCombiner;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -73,6 +74,8 @@ public final class PendingWriteQueue {
         if (promise == null) {
             throw new NullPointerException("promise");
         }
+        // It is possible for writes to be triggered from removeAndFailAll(). To preserve ordering,
+        // we should add them to the queue and let removeAndFailAll() fail them later.
         int messageSize = estimatorHandle.size(msg);
         if (messageSize < 0) {
             // Size may be unknow so just use 0
@@ -104,18 +107,20 @@ public final class PendingWriteQueue {
         if (cause == null) {
             throw new NullPointerException("cause");
         }
-        // Guard against re-entrance by directly reset
-        PendingWrite write = head;
-        head = tail = null;
-        size = 0;
+        // It is possible for some of the failed promises to trigger more writes. The new writes
+        // will "revive" the queue, so we need to clean them up until the queue is empty.
+        for (PendingWrite write = head; write != null; write = head) {
+            head = tail = null;
+            size = 0;
 
-        while (write != null) {
-            PendingWrite next = write.next;
-            ReferenceCountUtil.safeRelease(write.msg);
-            ChannelPromise promise = write.promise;
-            recycle(write, false);
-            safeFail(promise, cause);
-            write = next;
+            while (write != null) {
+                PendingWrite next = write.next;
+                ReferenceCountUtil.safeRelease(write.msg);
+                ChannelPromise promise = write.promise;
+                recycle(write, false);
+                safeFail(promise, cause);
+                write = next;
+            }
         }
         assertEmpty();
     }
@@ -165,17 +170,22 @@ public final class PendingWriteQueue {
         size = 0;
 
         ChannelPromise p = ctx.newPromise();
-        ChannelPromiseAggregator aggregator = new ChannelPromiseAggregator(p);
-        while (write != null) {
-            PendingWrite next = write.next;
-            Object msg = write.msg;
-            ChannelPromise promise = write.promise;
-            recycle(write, false);
-            ctx.write(msg, promise);
-            aggregator.add(promise);
-            write = next;
+        PromiseCombiner combiner = new PromiseCombiner();
+        try {
+            while (write != null) {
+                PendingWrite next = write.next;
+                Object msg = write.msg;
+                ChannelPromise promise = write.promise;
+                recycle(write, false);
+                combiner.add(promise);
+                ctx.write(msg, promise);
+                write = next;
+            }
+            assertEmpty();
+            combiner.finish(p);
+        } catch (Throwable cause) {
+            p.setFailure(cause);
         }
-        assertEmpty();
         return p;
     }
 

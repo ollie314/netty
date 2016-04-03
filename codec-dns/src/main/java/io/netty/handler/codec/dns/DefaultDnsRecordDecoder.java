@@ -18,7 +18,6 @@ package io.netty.handler.codec.dns;
 import io.netty.buffer.ByteBuf;
 import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.util.CharsetUtil;
-import io.netty.util.internal.StringUtil;
 
 /**
  * The default {@link DnsRecordDecoder} implementation.
@@ -26,6 +25,8 @@ import io.netty.util.internal.StringUtil;
  * @see DefaultDnsRecordEncoder
  */
 public class DefaultDnsRecordDecoder implements DnsRecordDecoder {
+
+    static final String ROOT = ".";
 
     /**
      * Creates a new instance.
@@ -87,6 +88,10 @@ public class DefaultDnsRecordDecoder implements DnsRecordDecoder {
             String name, DnsRecordType type, int dnsClass, long timeToLive,
             ByteBuf in, int offset, int length) throws Exception {
 
+        if (type == DnsRecordType.PTR) {
+            in.setIndex(offset, offset + length);
+            return new DefaultDnsPtrRecord(name, dnsClass, timeToLive, decodeName(in));
+        }
         return new DefaultDnsRawRecord(
                 name, type, dnsClass, timeToLive, in.duplicate().setIndex(offset, offset + length).retain());
     }
@@ -103,12 +108,30 @@ public class DefaultDnsRecordDecoder implements DnsRecordDecoder {
         int position = -1;
         int checked = 0;
         final int end = in.writerIndex();
-        final StringBuilder name = new StringBuilder(in.readableBytes() << 1);
-        for (int len = in.readUnsignedByte(); in.isReadable() && len != 0; len = in.readUnsignedByte()) {
-            boolean pointer = (len & 0xc0) == 0xc0;
+        final int readable = in.readableBytes();
+
+        // Looking at the spec we should always have at least enough readable bytes to read a byte here but it seems
+        // some servers do not respect this for empty names. So just workaround this and return an empty name in this
+        // case.
+        //
+        // See:
+        // - https://github.com/netty/netty/issues/5014
+        // - https://www.ietf.org/rfc/rfc1035.txt , Section 3.1
+        if (readable == 0) {
+            return ROOT;
+        }
+
+        final StringBuilder name = new StringBuilder(readable << 1);
+        while (in.isReadable()) {
+            final int len = in.readUnsignedByte();
+            final boolean pointer = (len & 0xc0) == 0xc0;
             if (pointer) {
                 if (position == -1) {
                     position = in.readerIndex() + 1;
+                }
+
+                if (!in.isReadable()) {
+                    throw new CorruptedFrameException("truncated pointer in a name");
                 }
 
                 final int next = (len & 0x3f) << 8 | in.readUnsignedByte();
@@ -122,18 +145,29 @@ public class DefaultDnsRecordDecoder implements DnsRecordDecoder {
                 if (checked >= end) {
                     throw new CorruptedFrameException("name contains a loop.");
                 }
-            } else {
+            } else if (len != 0) {
+                if (!in.isReadable(len)) {
+                    throw new CorruptedFrameException("truncated label in a name");
+                }
                 name.append(in.toString(in.readerIndex(), len, CharsetUtil.UTF_8)).append('.');
                 in.skipBytes(len);
+            } else { // len == 0
+                break;
             }
         }
+
         if (position != -1) {
             in.readerIndex(position);
         }
+
         if (name.length() == 0) {
-            return StringUtil.EMPTY_STRING;
+            return ROOT;
         }
 
-        return name.substring(0, name.length() - 1);
+        if (name.charAt(name.length() - 1) != '.') {
+            name.append('.');
+        }
+
+        return name.toString();
     }
 }

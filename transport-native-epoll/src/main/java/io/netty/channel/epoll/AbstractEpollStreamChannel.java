@@ -106,7 +106,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
      */
     @Deprecated
     protected AbstractEpollStreamChannel(Socket fd) {
-        this(fd, fd.getSoError() == 0);
+        this(fd, isSoErrorZero(fd));
     }
 
     protected AbstractEpollStreamChannel(Channel parent, Socket fd) {
@@ -640,7 +640,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         }
     }
 
-    private void safeClosePipe(FileDescriptor fd) {
+    private static void safeClosePipe(FileDescriptor fd) {
         if (fd != null) {
             try {
                 fd.close();
@@ -660,16 +660,16 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             return super.prepareToClose();
         }
 
-        private void handleReadException(ChannelPipeline pipeline, ByteBuf byteBuf, Throwable cause, boolean close) {
+        private void handleReadException(ChannelPipeline pipeline, ByteBuf byteBuf, Throwable cause, boolean close,
+                EpollRecvByteAllocatorHandle allocHandle) {
             if (byteBuf != null) {
                 if (byteBuf.isReadable()) {
-                    readPending = false;
                     pipeline.fireChannelRead(byteBuf);
                 } else {
                     byteBuf.release();
                 }
             }
-            recvBufAllocHandle().readComplete();
+            allocHandle.readComplete();
             pipeline.fireChannelReadComplete();
             pipeline.fireExceptionCaught(cause);
             if (close || cause instanceof IOException) {
@@ -816,27 +816,24 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         }
 
         @Override
-        protected EpollRecvByteAllocatorHandle newEpollHandle(RecvByteBufAllocator.Handle handle) {
-            return new EpollRecvByteAllocatorStreamingHandle(handle, isFlagSet(Native.EPOLLET));
+        EpollRecvByteAllocatorHandle newEpollHandle(RecvByteBufAllocator.Handle handle) {
+            return new EpollRecvByteAllocatorStreamingHandle(handle, config());
         }
 
         @Override
         void epollInReady() {
-            if (fd().isInputShutdown()) {
-                return;
-            }
             final ChannelConfig config = config();
-            boolean edgeTriggered = isFlagSet(Native.EPOLLET);
-
-            if (!readPending && !edgeTriggered && !config.isAutoRead()) {
+            if (!readPending && !config.isAutoRead() || fd().isInputShutdown()) {
                 // ChannelConfig.setAutoRead(false) was called in the meantime
                 clearEpollIn0();
                 return;
             }
 
+            final EpollRecvByteAllocatorHandle allocHandle = recvBufAllocHandle();
+            allocHandle.edgeTriggered(isFlagSet(Native.EPOLLET));
+
             final ChannelPipeline pipeline = pipeline();
             final ByteBufAllocator allocator = config.getAllocator();
-            final EpollRecvByteAllocatorHandle allocHandle = recvBufAllocHandle();
             allocHandle.reset(config);
 
             ByteBuf byteBuf = null;
@@ -862,6 +859,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
                     // we use a direct buffer here as the native implementations only be able
                     // to handle direct buffers.
                     byteBuf = allocHandle.allocate(allocator);
+                    epollInReadAttempted();
                     allocHandle.lastBytesRead(doReadBytes(byteBuf));
                     if (allocHandle.lastBytesRead() <= 0) {
                         // nothing was read, release the buffer.
@@ -870,10 +868,24 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
                         close = allocHandle.lastBytesRead() < 0;
                         break;
                     }
-                    readPending = false;
                     allocHandle.incMessagesRead(1);
                     pipeline.fireChannelRead(byteBuf);
                     byteBuf = null;
+
+                    if (fd().isInputShutdown()) {
+                        // We need to do this for two reasons:
+                        //
+                        // - If the input was shutdown in between (which may be the case when the user did it in the
+                        //   fireChannelRead(...) method we should not try to read again to not produce any
+                        //   miss-leading exceptions.
+                        //
+                        // - If the user closes the channel we need to ensure we not try to read from it again as
+                        //   the filedescriptor may be re-used already by the OS if the system is handling a lot of
+                        //   concurrent connections and so needs a lot of filedescriptors. If not do this we risk
+                        //   reading data from a filedescriptor that belongs to another socket then the socket that
+                        //   was "wrapped" by this Channel implementation.
+                        break;
+                    }
                 } while (allocHandle.continueReading());
 
                 allocHandle.readComplete();
@@ -881,21 +893,11 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
 
                 if (close) {
                     shutdownInput();
-                    close = false;
                 }
             } catch (Throwable t) {
-                handleReadException(pipeline, byteBuf, t, close);
-                checkResetEpollIn(edgeTriggered);
+                handleReadException(pipeline, byteBuf, t, close, allocHandle);
             } finally {
-                // Check if there is a readPending which was not processed yet.
-                // This could be for two reasons:
-                // * The user called Channel.read() or ChannelHandlerContext.read() in channelRead(...) method
-                // * The user called Channel.read() or ChannelHandlerContext.read() in channelReadComplete(...) method
-                //
-                // See https://github.com/netty/netty/issues/2254
-                if (!readPending && !config.isAutoRead()) {
-                    clearEpollIn0();
-                }
+                epollInFinally(config);
             }
         }
     }
@@ -935,7 +937,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             return this;
         }
 
-        abstract boolean spliceIn(RecvByteBufAllocator.Handle handle) throws IOException;
+        abstract boolean spliceIn(RecvByteBufAllocator.Handle handle);
 
         protected final int spliceIn(FileDescriptor pipeOut, RecvByteBufAllocator.Handle handle) throws IOException {
             // calculate the maximum amount of data we are allowed to splice
@@ -972,7 +974,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         }
 
         @Override
-        public boolean spliceIn(RecvByteBufAllocator.Handle handle) throws IOException {
+        public boolean spliceIn(RecvByteBufAllocator.Handle handle) {
             assert ch.eventLoop().inEventLoop();
             if (len == 0) {
                 promise.setSuccess();
@@ -1066,7 +1068,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
     private final class SpliceFdTask extends SpliceInTask {
         private final FileDescriptor fd;
         private final ChannelPromise promise;
-        private int offset;
+        private final int offset;
 
         SpliceFdTask(FileDescriptor fd, int offset, int len, ChannelPromise promise) {
             super(len, promise);
@@ -1081,7 +1083,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         }
 
         @Override
-        public boolean spliceIn(RecvByteBufAllocator.Handle handle) throws IOException {
+        public boolean spliceIn(RecvByteBufAllocator.Handle handle) {
             assert eventLoop().inEventLoop();
             if (len == 0) {
                 promise.setSuccess();

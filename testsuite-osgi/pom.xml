@@ -20,7 +20,7 @@
   <parent>
     <groupId>io.netty</groupId>
     <artifactId>netty-parent</artifactId>
-    <version>4.1.0.CR4-SNAPSHOT</version>
+    <version>4.1.0.Final-SNAPSHOT</version>
   </parent>
 
   <artifactId>netty-testsuite-osgi</artifactId>
@@ -221,12 +221,12 @@
         <groupId>org.ops4j.pax.exam</groupId>
         <artifactId>maven-paxexam-plugin</artifactId>
         <executions>
-           <execution>
-             <id>generate-config</id>
-             <goals>
-               <goal>generate-depends-file</goal>
-             </goals>
-           </execution>
+          <execution>
+            <id>generate-config</id>
+            <goals>
+              <goal>generate-depends-file</goal>
+            </goals>
+          </execution>
         </executions>
       </plugin>
       <plugin>

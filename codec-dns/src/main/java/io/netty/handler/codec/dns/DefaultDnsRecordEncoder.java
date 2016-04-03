@@ -20,6 +20,8 @@ import io.netty.buffer.ByteBufUtil;
 import io.netty.handler.codec.UnsupportedMessageTypeException;
 import io.netty.util.internal.StringUtil;
 
+import static io.netty.handler.codec.dns.DefaultDnsRecordDecoder.ROOT;
+
 /**
  * The default {@link DnsRecordEncoder} implementation.
  *
@@ -43,11 +45,23 @@ public class DefaultDnsRecordEncoder implements DnsRecordEncoder {
     public void encodeRecord(DnsRecord record, ByteBuf out) throws Exception {
         if (record instanceof DnsQuestion) {
             encodeQuestion((DnsQuestion) record, out);
+        } else if (record instanceof DnsPtrRecord) {
+            encodePtrRecord((DnsPtrRecord) record, out);
         } else if (record instanceof DnsRawRecord) {
             encodeRawRecord((DnsRawRecord) record, out);
         } else {
             throw new UnsupportedMessageTypeException(StringUtil.simpleClassName(record));
         }
+    }
+
+    private void encodePtrRecord(DnsPtrRecord record, ByteBuf out) throws Exception {
+        encodeName(record.name(), out);
+
+        out.writeShort(record.type().intValue());
+        out.writeShort(record.dnsClass());
+        out.writeInt((int) record.timeToLive());
+
+        encodeName(record.hostname(), out);
     }
 
     private void encodeRawRecord(DnsRawRecord record, ByteBuf out) throws Exception {
@@ -65,15 +79,24 @@ public class DefaultDnsRecordEncoder implements DnsRecordEncoder {
     }
 
     protected void encodeName(String name, ByteBuf buf) throws Exception {
-        String[] parts = StringUtil.split(name, '.');
-        for (String part: parts) {
-            final int partLen = part.length();
-            if (partLen == 0) {
-                continue;
-            }
-            buf.writeByte(partLen);
-            ByteBufUtil.writeAscii(buf, part);
+        if (ROOT.equals(name)) {
+            // Root domain
+            buf.writeByte(0);
+            return;
         }
+
+        final String[] labels = StringUtil.split(name, '.');
+        for (String label : labels) {
+            final int labelLen = label.length();
+            if (labelLen == 0) {
+                // zero-length label means the end of the name.
+                break;
+            }
+
+            buf.writeByte(labelLen);
+            ByteBufUtil.writeAscii(buf, label);
+        }
+
         buf.writeByte(0); // marks end of name field
     }
 }

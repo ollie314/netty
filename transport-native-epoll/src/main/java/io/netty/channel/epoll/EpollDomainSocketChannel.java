@@ -23,7 +23,6 @@ import io.netty.channel.unix.DomainSocketAddress;
 import io.netty.channel.unix.DomainSocketChannel;
 import io.netty.channel.unix.FileDescriptor;
 import io.netty.channel.unix.Socket;
-import io.netty.util.internal.OneTimeTask;
 
 import java.net.SocketAddress;
 
@@ -149,35 +148,36 @@ public final class EpollDomainSocketChannel extends AbstractEpollStreamChannel i
         }
 
         private void epollInReadFd() {
-            if (fd().isInputShutdown()) {
-                return;
-            }
-            boolean edgeTriggered = isFlagSet(Native.EPOLLET);
             final ChannelConfig config = config();
-            if (!readPending && !edgeTriggered && !config.isAutoRead()) {
+            if (!readPending && !config.isAutoRead() || fd().isInputShutdown()) {
                 // ChannelConfig.setAutoRead(false) was called in the meantime
                 clearEpollIn0();
                 return;
             }
+            final EpollRecvByteAllocatorHandle allocHandle = recvBufAllocHandle();
+            allocHandle.edgeTriggered(isFlagSet(Native.EPOLLET));
 
             final ChannelPipeline pipeline = pipeline();
-            final EpollRecvByteAllocatorHandle allocHandle = recvBufAllocHandle();
             allocHandle.reset(config);
 
             try {
-                do {
-                    int socketFd = Native.recvFd(fd().intValue());
-                    if (socketFd == 0) {
-                        break;
-                    }
-                    if (socketFd == -1) {
+                readLoop: do {
+                    // lastBytesRead represents the fd. We use lastBytesRead because it must be set so that the
+                    // EpollRecvByteAllocatorHandle knows if it should try to read again or not when autoRead is
+                    // enabled.
+                    epollInReadAttempted();
+                    allocHandle.lastBytesRead(Native.recvFd(fd().intValue()));
+                    switch(allocHandle.lastBytesRead()) {
+                    case 0:
+                        break readLoop;
+                    case -1:
                         close(voidPromise());
                         return;
+                    default:
+                        allocHandle.incMessagesRead(1);
+                        pipeline.fireChannelRead(new FileDescriptor(allocHandle.lastBytesRead()));
+                        break;
                     }
-
-                    readPending = false;
-                    allocHandle.incMessagesRead(1);
-                    pipeline.fireChannelRead(new FileDescriptor(socketFd));
                 } while (allocHandle.continueReading());
 
                 allocHandle.readComplete();
@@ -186,17 +186,8 @@ public final class EpollDomainSocketChannel extends AbstractEpollStreamChannel i
                 allocHandle.readComplete();
                 pipeline.fireChannelReadComplete();
                 pipeline.fireExceptionCaught(t);
-                checkResetEpollIn(edgeTriggered);
             } finally {
-                // Check if there is a readPending which was not processed yet.
-                // This could be for two reasons:
-                // * The user called Channel.read() or ChannelHandlerContext.read() in channelRead(...) method
-                // * The user called Channel.read() or ChannelHandlerContext.read() in channelReadComplete(...) method
-                //
-                // See https://github.com/netty/netty/issues/2254
-                if (!readPending && !config.isAutoRead()) {
-                    clearEpollIn0();
-                }
+                epollInFinally(config);
             }
         }
     }

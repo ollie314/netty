@@ -194,7 +194,7 @@ public final class AsciiString implements CharSequence, Comparable<CharSequence>
      */
     public AsciiString(char[] value, Charset charset, int start, int length) {
         CharBuffer cbuf = CharBuffer.wrap(value, start, length);
-        CharsetEncoder encoder = CharsetUtil.getEncoder(charset);
+        CharsetEncoder encoder = CharsetUtil.encoder(charset);
         ByteBuffer nativeBuffer = ByteBuffer.allocate((int) (encoder.maxBytesPerChar() * length));
         encoder.encode(cbuf, nativeBuffer, true);
         final int bufferOffset = nativeBuffer.arrayOffset();
@@ -241,7 +241,7 @@ public final class AsciiString implements CharSequence, Comparable<CharSequence>
      */
     public AsciiString(CharSequence value, Charset charset, int start, int length) {
         CharBuffer cbuf = CharBuffer.wrap(value, start, start + length);
-        CharsetEncoder encoder = CharsetUtil.getEncoder(charset);
+        CharsetEncoder encoder = CharsetUtil.encoder(charset);
         ByteBuffer nativeBuffer = ByteBuffer.allocate((int) (encoder.maxBytesPerChar() * length));
         encoder.encode(cbuf, nativeBuffer, true);
         final int offset = nativeBuffer.arrayOffset();
@@ -707,6 +707,34 @@ public final class AsciiString implements CharSequence, Comparable<CharSequence>
                 }
                 start = i + 1;
             }
+        } catch (Exception e) {
+            PlatformDependent.throwException(e);
+            return -1;
+        }
+    }
+
+    /**
+     * Searches in this string for the index of the specified char {@code ch}.
+     * The search for the char starts at the specified offset {@code start} and moves towards the end of this string.
+     *
+     * @param ch the char to find.
+     * @param start the starting offset.
+     * @return the index of the first occurrence of the specified char {@code ch} in this string,
+     * -1 if found no occurrence.
+     */
+    public int indexOf(char ch, int start) {
+        if (start < 0) {
+            start = 0;
+        }
+
+        final int thisLen = length();
+
+        if (ch > MAX_CHAR_VALUE) {
+            return -1;
+        }
+
+        try {
+            return forEachByte(start, thisLen - start, new IndexOfProcessor((byte) ch));
         } catch (Exception e) {
             PlatformDependent.throwException(e);
             return -1;
@@ -1735,6 +1763,38 @@ public final class AsciiString implements CharSequence, Comparable<CharSequence>
         }
         for (int i = startPos; i < endLimit; i++) {
             if (regionMatchesAscii(str, true, i, searchStr, 0, searchStrLen)) {
+                return i;
+            }
+        }
+        return INDEX_NOT_FOUND;
+    }
+
+    /**
+     * <p>Finds the first index in the {@code CharSequence} that matches the
+     * specified character.</p>
+     *
+     * @param cs  the {@code CharSequence} to be processed, not null
+     * @param searchChar the char to be searched for
+     * @param start  the start index, negative starts at the string start
+     * @return the index where the search char was found,
+     * -1 if char {@code searchChar} is not found or {@code cs == null}
+     */
+    //-----------------------------------------------------------------------
+    public static int indexOf(final CharSequence cs, final char searchChar, int start) {
+        if (cs instanceof String) {
+            return ((String) cs).indexOf(searchChar, start);
+        } else if (cs instanceof AsciiString) {
+            return ((AsciiString) cs).indexOf(searchChar, start);
+        }
+        if (cs == null) {
+            return INDEX_NOT_FOUND;
+        }
+        final int sz = cs.length();
+        if (start < 0) {
+            start = 0;
+        }
+        for (int i = start; i < sz; i++) {
+            if (cs.charAt(i) == searchChar) {
                 return i;
             }
         }

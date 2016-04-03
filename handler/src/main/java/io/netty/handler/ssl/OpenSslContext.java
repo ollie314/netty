@@ -29,14 +29,17 @@ import org.apache.tomcat.jni.Pool;
 import org.apache.tomcat.jni.SSL;
 import org.apache.tomcat.jni.SSLContext;
 
+import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509ExtendedTrustManager;
 import javax.net.ssl.X509TrustManager;
+import java.io.File;
 import java.security.PrivateKey;
 import java.security.cert.Certificate;
+import java.security.cert.CertificateException;
 import java.security.cert.CertificateExpiredException;
 import java.security.cert.CertificateNotYetValidException;
 import java.security.cert.CertificateRevokedException;
@@ -565,5 +568,28 @@ public abstract class OpenSslContext extends SslContext {
             throw new IllegalStateException("Could not write data to memory BIO");
         }
         return bio;
+    }
+
+    static PrivateKey toPrivateKeyInternal(File keyFile, String keyPassword) throws SSLException {
+        try {
+            return SslContext.toPrivateKey(keyFile, keyPassword);
+        } catch (Exception e) {
+            throw new SSLException(e);
+        }
+    }
+
+    static X509Certificate[] toX509CertificatesInternal(File file) throws SSLException {
+        try {
+            return SslContext.toX509Certificates(file);
+        } catch (CertificateException e) {
+            throw new SSLException(e);
+        }
+    }
+
+    static void checkKeyManagerFactory(KeyManagerFactory keyManagerFactory) {
+        if (keyManagerFactory != null) {
+            throw new IllegalArgumentException(
+                    "KeyManagerFactory is currently not supported with OpenSslContext");
+        }
     }
 }

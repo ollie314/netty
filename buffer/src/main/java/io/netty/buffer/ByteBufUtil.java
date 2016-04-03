@@ -60,6 +60,8 @@ public final class ByteBufUtil {
     private static final byte WRITE_UTF_UNKNOWN = (byte) '?';
     private static final int MAX_CHAR_BUFFER_SIZE;
     private static final int THREAD_LOCAL_BUFFER_SIZE;
+    private static final int MAX_BYTES_PER_CHAR_UTF8 =
+            (int) CharsetUtil.encoder(CharsetUtil.UTF_8).maxBytesPerChar();
 
     static final ByteBufAllocator DEFAULT_ALLOCATOR;
 
@@ -355,21 +357,28 @@ public final class ByteBufUtil {
 
     /**
      * Encode a {@link CharSequence} in <a href="http://en.wikipedia.org/wiki/UTF-8">UTF-8</a> and write
+     * it to a {@link ByteBuf} allocated with {@code alloc}.
+     * @param alloc The allocator used to allocate a new {@link ByteBuf}.
+     * @param seq The characters to write into a buffer.
+     * @return The {@link ByteBuf} which contains the <a href="http://en.wikipedia.org/wiki/UTF-8">UTF-8</a> encoded
+     * result.
+     */
+    public static ByteBuf writeUtf8(ByteBufAllocator alloc, CharSequence seq) {
+        // UTF-8 uses max. 3 bytes per char, so calculate the worst case.
+        ByteBuf buf = alloc.buffer(seq.length() * MAX_BYTES_PER_CHAR_UTF8);
+        writeUtf8(buf, seq);
+        return buf;
+    }
+
+    /**
+     * Encode a {@link CharSequence} in <a href="http://en.wikipedia.org/wiki/UTF-8">UTF-8</a> and write
      * it to a {@link ByteBuf}.
      *
      * This method returns the actual number of bytes written.
      */
     public static int writeUtf8(ByteBuf buf, CharSequence seq) {
-        if (buf == null) {
-            throw new NullPointerException("buf");
-        }
-        if (seq == null) {
-            throw new NullPointerException("seq");
-        }
-        // UTF-8 uses max. 3 bytes per char, so calculate the worst case.
         final int len = seq.length();
-        final int maxSize = len * 3;
-        buf.ensureWritable(maxSize);
+        buf.ensureWritable(len * MAX_BYTES_PER_CHAR_UTF8);
 
         for (;;) {
             if (buf instanceof AbstractByteBuf) {
@@ -437,18 +446,27 @@ public final class ByteBufUtil {
     }
 
     /**
+     * Encode a {@link CharSequence} in <a href="http://en.wikipedia.org/wiki/ASCII">ASCII</a> and write
+     * it to a {@link ByteBuf} allocated with {@code alloc}.
+     * @param alloc The allocator used to allocate a new {@link ByteBuf}.
+     * @param seq The characters to write into a buffer.
+     * @return The {@link ByteBuf} which contains the <a href="http://en.wikipedia.org/wiki/ASCII">ASCII</a> encoded
+     * result.
+     */
+    public static ByteBuf writeAscii(ByteBufAllocator alloc, CharSequence seq) {
+        // ASCII uses 1 byte per char
+        ByteBuf buf = alloc.buffer(seq.length());
+        writeAscii(buf, seq);
+        return buf;
+    }
+
+    /**
      * Encode a {@link CharSequence} in <a href="http://en.wikipedia.org/wiki/ASCII">ASCII</a> and write it
      * to a {@link ByteBuf}.
      *
      * This method returns the actual number of bytes written.
      */
     public static int writeAscii(ByteBuf buf, CharSequence seq) {
-        if (buf == null) {
-            throw new NullPointerException("buf");
-        }
-        if (seq == null) {
-            throw new NullPointerException("seq");
-        }
         // ASCII uses 1 byte per char
         final int len = seq.length();
         buf.ensureWritable(len);
@@ -489,12 +507,26 @@ public final class ByteBufUtil {
      * is allocated via the {@link ByteBufAllocator}.
      */
     public static ByteBuf encodeString(ByteBufAllocator alloc, CharBuffer src, Charset charset) {
-        return encodeString0(alloc, false, src, charset);
+        return encodeString0(alloc, false, src, charset, 0);
     }
 
-    static ByteBuf encodeString0(ByteBufAllocator alloc, boolean enforceHeap, CharBuffer src, Charset charset) {
-        final CharsetEncoder encoder = CharsetUtil.getEncoder(charset);
-        int length = (int) ((double) src.remaining() * encoder.maxBytesPerChar());
+    /**
+     * Encode the given {@link CharBuffer} using the given {@link Charset} into a new {@link ByteBuf} which
+     * is allocated via the {@link ByteBufAllocator}.
+     *
+     * @param alloc The {@link ByteBufAllocator} to allocate {@link ByteBuf}.
+     * @param src The {@link CharBuffer} to encode.
+     * @param charset The specified {@link Charset}.
+     * @param extraCapacity the extra capacity to alloc except the space for decoding.
+     */
+    public static ByteBuf encodeString(ByteBufAllocator alloc, CharBuffer src, Charset charset, int extraCapacity) {
+        return encodeString0(alloc, false, src, charset, extraCapacity);
+    }
+
+    static ByteBuf encodeString0(ByteBufAllocator alloc, boolean enforceHeap, CharBuffer src, Charset charset,
+                                 int extraCapacity) {
+        final CharsetEncoder encoder = CharsetUtil.encoder(charset);
+        int length = (int) ((double) src.remaining() * encoder.maxBytesPerChar()) + extraCapacity;
         boolean release = true;
         final ByteBuf dst;
         if (enforceHeap) {
@@ -529,7 +561,7 @@ public final class ByteBufUtil {
         if (len == 0) {
             return StringUtil.EMPTY_STRING;
         }
-        final CharsetDecoder decoder = CharsetUtil.getDecoder(charset);
+        final CharsetDecoder decoder = CharsetUtil.decoder(charset);
         final int maxLength = (int) ((double) len * decoder.maxCharsPerByte());
         CharBuffer dst = CHAR_BUFFERS.get();
         if (dst.length() < maxLength) {

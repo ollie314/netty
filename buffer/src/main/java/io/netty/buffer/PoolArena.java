@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 abstract class PoolArena<T> implements PoolArenaMetric {
     static final boolean HAS_UNSAFE = PlatformDependent.hasUnsafe();
@@ -57,17 +58,21 @@ abstract class PoolArena<T> implements PoolArenaMetric {
     private final List<PoolChunkListMetric> chunkListMetrics;
 
     // Metrics for allocations and deallocations
-    private long allocationsTiny;
-    private long allocationsSmall;
     private long allocationsNormal;
     // We need to use the LongCounter here as this is not guarded via synchronized block.
+    private final LongCounter allocationsTiny = PlatformDependent.newLongCounter();
+    private final LongCounter allocationsSmall = PlatformDependent.newLongCounter();
     private final LongCounter allocationsHuge = PlatformDependent.newLongCounter();
 
     private long deallocationsTiny;
     private long deallocationsSmall;
     private long deallocationsNormal;
+
     // We need to use the LongCounter here as this is not guarded via synchronized block.
     private final LongCounter deallocationsHuge = PlatformDependent.newLongCounter();
+
+    // Number of thread caches backed by this arena.
+    final AtomicInteger numThreadCaches = new AtomicInteger();
 
     // TODO: Test if adding padding helps under contention
     //private long pad0, pad1, pad2, pad3, pad4, pad5, pad6, pad7;
@@ -195,9 +200,9 @@ abstract class PoolArena<T> implements PoolArenaMetric {
                     s.chunk.initBufWithSubpage(buf, handle, reqCapacity);
 
                     if (tiny) {
-                        ++allocationsTiny;
+                        allocationsTiny.increment();
                     } else {
-                        ++allocationsSmall;
+                        allocationsSmall.increment();
                     }
                     return;
                 }
@@ -382,6 +387,11 @@ abstract class PoolArena<T> implements PoolArenaMetric {
     }
 
     @Override
+    public int numThreadCaches() {
+        return numThreadCaches.get();
+    }
+
+    @Override
     public int numTinySubpages() {
         return tinySubpagePools.length;
     }
@@ -432,41 +442,49 @@ abstract class PoolArena<T> implements PoolArenaMetric {
 
     @Override
     public long numAllocations() {
-        return allocationsTiny + allocationsSmall + allocationsNormal + allocationsHuge.value();
+        final long allocsNormal;
+        synchronized (this) {
+            allocsNormal = allocationsNormal;
+        }
+        return allocationsTiny.value() + allocationsSmall.value() + allocsNormal + allocationsHuge.value();
     }
 
     @Override
     public long numTinyAllocations() {
-        return allocationsTiny;
+        return allocationsTiny.value();
     }
 
     @Override
     public long numSmallAllocations() {
-        return allocationsSmall;
+        return allocationsSmall.value();
     }
 
     @Override
-    public long numNormalAllocations() {
+    public synchronized long numNormalAllocations() {
         return allocationsNormal;
     }
 
     @Override
     public long numDeallocations() {
-        return deallocationsTiny + deallocationsSmall + allocationsNormal + deallocationsHuge.value();
+        final long deallocs;
+        synchronized (this) {
+            deallocs = deallocationsTiny + deallocationsSmall + deallocationsNormal;
+        }
+        return deallocs + deallocationsHuge.value();
     }
 
     @Override
-    public long numTinyDeallocations() {
+    public synchronized long numTinyDeallocations() {
         return deallocationsTiny;
     }
 
     @Override
-    public long numSmallDeallocations() {
+    public synchronized long numSmallDeallocations() {
         return deallocationsSmall;
     }
 
     @Override
-    public long numNormalDeallocations() {
+    public synchronized long numNormalDeallocations() {
         return deallocationsNormal;
     }
 
@@ -481,8 +499,12 @@ abstract class PoolArena<T> implements PoolArenaMetric {
     }
 
     @Override
-    public long numActiveAllocations() {
-        long val = numAllocations() - numDeallocations();
+    public  long numActiveAllocations() {
+        long val = allocationsTiny.value() + allocationsSmall.value() + allocationsHuge.value()
+                - deallocationsHuge.value();
+        synchronized (this) {
+            val += allocationsNormal - (deallocationsTiny + deallocationsSmall + deallocationsNormal);
+        }
         return val >= 0 ? val : 0;
     }
 
@@ -500,7 +522,10 @@ abstract class PoolArena<T> implements PoolArenaMetric {
 
     @Override
     public long numActiveNormalAllocations() {
-        long val = numNormalAllocations() - numNormalDeallocations();
+        final long val;
+        synchronized (this) {
+            val = allocationsNormal - deallocationsNormal;
+        }
         return val >= 0 ? val : 0;
     }
 
