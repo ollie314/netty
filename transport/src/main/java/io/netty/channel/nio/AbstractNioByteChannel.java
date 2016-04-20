@@ -76,7 +76,7 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
                 RecvByteBufAllocator.Handle allocHandle) {
             if (byteBuf != null) {
                 if (byteBuf.isReadable()) {
-                    setReadPending(false);
+                    readPending = false;
                     pipeline.fireChannelRead(byteBuf);
                 } else {
                     byteBuf.release();
@@ -93,12 +93,6 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
         @Override
         public final void read() {
             final ChannelConfig config = config();
-            if (!config.isAutoRead() && !isReadPending()) {
-                // ChannelConfig.setAutoRead(false) was called in the meantime
-                removeReadOp();
-                return;
-            }
-
             final ChannelPipeline pipeline = pipeline();
             final ByteBufAllocator allocator = config.getAllocator();
             final RecvByteBufAllocator.Handle allocHandle = recvBufAllocHandle();
@@ -107,7 +101,6 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
             ByteBuf byteBuf = null;
             boolean close = false;
             try {
-                boolean needReadPendingReset = true;
                 do {
                     byteBuf = allocHandle.allocate(allocator);
                     allocHandle.lastBytesRead(doReadBytes(byteBuf));
@@ -120,10 +113,7 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
                     }
 
                     allocHandle.incMessagesRead(1);
-                    if (needReadPendingReset) {
-                        needReadPendingReset = false;
-                        setReadPending(false);
-                    }
+                    readPending = false;
                     pipeline.fireChannelRead(byteBuf);
                     byteBuf = null;
                 } while (allocHandle.continueReading());
@@ -143,7 +133,7 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
                 // * The user called Channel.read() or ChannelHandlerContext.read() in channelReadComplete(...) method
                 //
                 // See https://github.com/netty/netty/issues/2254
-                if (!config.isAutoRead() && !isReadPending()) {
+                if (!readPending && !config.isAutoRead()) {
                     removeReadOp();
                 }
             }
@@ -201,7 +191,7 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
                 }
             } else if (msg instanceof FileRegion) {
                 FileRegion region = (FileRegion) msg;
-                boolean done = region.transfered() >= region.count();
+                boolean done = region.transferred() >= region.count();
 
                 if (!done) {
                     long flushedAmount = 0;
@@ -217,7 +207,7 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
                         }
 
                         flushedAmount += localFlushedAmount;
-                        if (region.transfered() >= region.count()) {
+                        if (region.transferred() >= region.count()) {
                             done = true;
                             break;
                         }

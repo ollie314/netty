@@ -26,6 +26,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static java.lang.Math.max;
+
 abstract class PoolArena<T> implements PoolArenaMetric {
     static final boolean HAS_UNSAFE = PlatformDependent.hasUnsafe();
 
@@ -63,6 +65,7 @@ abstract class PoolArena<T> implements PoolArenaMetric {
     private final LongCounter allocationsTiny = PlatformDependent.newLongCounter();
     private final LongCounter allocationsSmall = PlatformDependent.newLongCounter();
     private final LongCounter allocationsHuge = PlatformDependent.newLongCounter();
+    private final LongCounter activeBytesHuge = PlatformDependent.newLongCounter();
 
     private long deallocationsTiny;
     private long deallocationsSmall;
@@ -95,12 +98,12 @@ abstract class PoolArena<T> implements PoolArenaMetric {
             smallSubpagePools[i] = newSubpagePoolHead(pageSize);
         }
 
-        q100 = new PoolChunkList<T>(null, 100, Integer.MAX_VALUE);
-        q075 = new PoolChunkList<T>(q100, 75, 100);
-        q050 = new PoolChunkList<T>(q075, 50, 100);
-        q025 = new PoolChunkList<T>(q050, 25, 75);
-        q000 = new PoolChunkList<T>(q025, 1, 50);
-        qInit = new PoolChunkList<T>(q000, Integer.MIN_VALUE, 25);
+        q100 = new PoolChunkList<T>(null, 100, Integer.MAX_VALUE, chunkSize);
+        q075 = new PoolChunkList<T>(q100, 75, 100, chunkSize);
+        q050 = new PoolChunkList<T>(q075, 50, 100, chunkSize);
+        q025 = new PoolChunkList<T>(q050, 25, 75, chunkSize);
+        q000 = new PoolChunkList<T>(q025, 1, 50, chunkSize);
+        qInit = new PoolChunkList<T>(q000, Integer.MIN_VALUE, 25, chunkSize);
 
         q100.prevList(q075);
         q075.prevList(q050);
@@ -223,30 +226,35 @@ abstract class PoolArena<T> implements PoolArenaMetric {
     }
 
     private synchronized void allocateNormal(PooledByteBuf<T> buf, int reqCapacity, int normCapacity) {
-            ++allocationsNormal;
         if (q050.allocate(buf, reqCapacity, normCapacity) || q025.allocate(buf, reqCapacity, normCapacity) ||
             q000.allocate(buf, reqCapacity, normCapacity) || qInit.allocate(buf, reqCapacity, normCapacity) ||
-            q075.allocate(buf, reqCapacity, normCapacity) || q100.allocate(buf, reqCapacity, normCapacity)) {
+            q075.allocate(buf, reqCapacity, normCapacity)) {
+            ++allocationsNormal;
             return;
         }
 
         // Add a new chunk.
         PoolChunk<T> c = newChunk(pageSize, maxOrder, pageShifts, chunkSize);
         long handle = c.allocate(normCapacity);
+        ++allocationsNormal;
         assert handle > 0;
         c.initBuf(buf, handle, reqCapacity);
         qInit.add(c);
     }
 
     private void allocateHuge(PooledByteBuf<T> buf, int reqCapacity) {
+        PoolChunk<T> chunk = newUnpooledChunk(reqCapacity);
+        activeBytesHuge.add(chunk.chunkSize());
+        buf.initUnpooled(chunk, reqCapacity);
         allocationsHuge.increment();
-        buf.initUnpooled(newUnpooledChunk(reqCapacity), reqCapacity);
     }
 
     void free(PoolChunk<T> chunk, long handle, int normCapacity, PoolThreadCache cache) {
         if (chunk.unpooled) {
-            allocationsHuge.decrement();
+            int size = chunk.chunkSize();
             destroyChunk(chunk);
+            activeBytesHuge.add(-size);
+            deallocationsHuge.decrement();
         } else {
             SizeClass sizeClass = sizeClass(normCapacity);
             if (cache != null && cache.add(this, chunk, handle, normCapacity, sizeClass)) {
@@ -505,19 +513,17 @@ abstract class PoolArena<T> implements PoolArenaMetric {
         synchronized (this) {
             val += allocationsNormal - (deallocationsTiny + deallocationsSmall + deallocationsNormal);
         }
-        return val >= 0 ? val : 0;
+        return max(val, 0);
     }
 
     @Override
     public long numActiveTinyAllocations() {
-        long val = numTinyAllocations() - numTinyDeallocations();
-        return val >= 0 ? val : 0;
+        return max(numTinyAllocations() - numTinyDeallocations(), 0);
     }
 
     @Override
     public long numActiveSmallAllocations() {
-        long val = numSmallAllocations() - numSmallDeallocations();
-        return val >= 0 ? val : 0;
+        return max(numSmallAllocations() - numSmallDeallocations(), 0);
     }
 
     @Override
@@ -526,13 +532,25 @@ abstract class PoolArena<T> implements PoolArenaMetric {
         synchronized (this) {
             val = allocationsNormal - deallocationsNormal;
         }
-        return val >= 0 ? val : 0;
+        return max(val, 0);
     }
 
     @Override
     public long numActiveHugeAllocations() {
-        long val = numHugeAllocations() - numHugeDeallocations();
-        return val >= 0 ? val : 0;
+        return max(numHugeAllocations() - numHugeDeallocations(), 0);
+    }
+
+    @Override
+    public long numActiveBytes() {
+        long val = activeBytesHuge.value();
+        synchronized (this) {
+            for (int i = 0; i < chunkListMetrics.size(); i++) {
+                for (PoolChunkMetric m: chunkListMetrics.get(i)) {
+                    val += m.chunkSize();
+                }
+            }
+        }
+        return max(0, val);
     }
 
     protected abstract PoolChunk<T> newChunk(int pageSize, int maxOrder, int pageShifts, int chunkSize);
