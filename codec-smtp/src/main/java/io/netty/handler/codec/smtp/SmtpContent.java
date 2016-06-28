@@ -15,7 +15,9 @@
  */
 package io.netty.handler.codec.smtp;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufHolder;
+import io.netty.util.internal.UnstableApi;
 
 /**
  * Content that is sent after the {@code DATA} request.
@@ -23,12 +25,19 @@ import io.netty.buffer.ByteBufHolder;
  * and the lines that start with a DOT must be escaped with an extra DOT as
  * specified by <a href="https://www.ietf.org/rfc/rfc2821.txt">RFC2821</a>.
  */
+@UnstableApi
 public interface SmtpContent extends ByteBufHolder {
     @Override
     SmtpContent copy();
 
     @Override
     SmtpContent duplicate();
+
+    @Override
+    SmtpContent retainedDuplicate();
+
+    @Override
+    SmtpContent replace(ByteBuf content);
 
     @Override
     SmtpContent retain();

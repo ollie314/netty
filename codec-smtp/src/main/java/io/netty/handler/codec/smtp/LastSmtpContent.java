@@ -17,6 +17,7 @@ package io.netty.handler.codec.smtp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.util.internal.UnstableApi;
 
 /**
  * The last part of a sequence of {@link SmtpContent}s that are sent after a {@code DATA} request.
@@ -24,6 +25,7 @@ import io.netty.buffer.Unpooled;
  * and the lines that start with a DOT must be escaped with an extra DOT as
  * specified by <a href="https://www.ietf.org/rfc/rfc2821.txt">RFC2821</a>.
  */
+@UnstableApi
 public interface LastSmtpContent extends SmtpContent {
 
     /**
@@ -38,6 +40,16 @@ public interface LastSmtpContent extends SmtpContent {
         @Override
         public LastSmtpContent duplicate() {
             return this;
+        }
+
+        @Override
+        public LastSmtpContent retainedDuplicate() {
+            return this;
+        }
+
+        @Override
+        public LastSmtpContent replace(ByteBuf content) {
+            return new DefaultLastSmtpContent(content);
         }
 
         @Override
@@ -86,6 +98,12 @@ public interface LastSmtpContent extends SmtpContent {
 
     @Override
     LastSmtpContent duplicate();
+
+    @Override
+    LastSmtpContent retainedDuplicate();
+
+    @Override
+    LastSmtpContent replace(ByteBuf content);
 
     @Override
     LastSmtpContent retain();

@@ -18,12 +18,14 @@ package io.netty.handler.codec.dns;
 import io.netty.buffer.ByteBuf;
 import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.util.CharsetUtil;
+import io.netty.util.internal.UnstableApi;
 
 /**
  * The default {@link DnsRecordDecoder} implementation.
  *
  * @see DefaultDnsRecordEncoder
  */
+@UnstableApi
 public class DefaultDnsRecordDecoder implements DnsRecordDecoder {
 
     static final String ROOT = ".";
@@ -90,10 +92,10 @@ public class DefaultDnsRecordDecoder implements DnsRecordDecoder {
 
         if (type == DnsRecordType.PTR) {
             in.setIndex(offset, offset + length);
-            return new DefaultDnsPtrRecord(name, dnsClass, timeToLive, decodeName(in));
+            return new DefaultDnsPtrRecord(name, dnsClass, timeToLive, decodeName0(in));
         }
         return new DefaultDnsRawRecord(
-                name, type, dnsClass, timeToLive, in.duplicate().setIndex(offset, offset + length).retain());
+                name, type, dnsClass, timeToLive, in.retainedDuplicate().setIndex(offset, offset + length));
     }
 
     /**
@@ -104,7 +106,19 @@ public class DefaultDnsRecordDecoder implements DnsRecordDecoder {
      * @param in the byte buffer containing the DNS packet
      * @return the domain name for an entry
      */
-    protected String decodeName(ByteBuf in) {
+    protected String decodeName0(ByteBuf in) {
+        return decodeName(in);
+    }
+
+    /**
+     * Retrieves a domain name given a buffer containing a DNS packet. If the
+     * name contains a pointer, the position of the buffer will be set to
+     * directly after the pointer's index after the name has been read.
+     *
+     * @param in the byte buffer containing the DNS packet
+     * @return the domain name for an entry
+     */
+    public static String decodeName(ByteBuf in) {
         int position = -1;
         int checked = 0;
         final int end = in.writerIndex();

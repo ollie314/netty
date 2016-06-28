@@ -16,8 +16,10 @@
 package io.netty.buffer;
 
 import io.netty.util.ByteProcessor;
+import io.netty.util.CharsetUtil;
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ResourceLeakDetector;
+import io.netty.util.ResourceLeakDetectorFactory;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.SystemPropertyUtil;
@@ -51,7 +53,8 @@ public abstract class AbstractByteBuf extends ByteBuf {
         }
     }
 
-    static final ResourceLeakDetector<ByteBuf> leakDetector = new ResourceLeakDetector<ByteBuf>(ByteBuf.class);
+    static final ResourceLeakDetector<ByteBuf> leakDetector =
+            ResourceLeakDetectorFactory.instance().newResourceLeakDetector(ByteBuf.class);
 
     int readerIndex;
     int writerIndex;
@@ -484,6 +487,19 @@ public abstract class AbstractByteBuf extends ByteBuf {
     }
 
     @Override
+    public CharSequence getCharSequence(int index, int length, Charset charset) {
+        // TODO: We could optimize this for UTF8 and US_ASCII
+        return toString(index, length, charset);
+    }
+
+    @Override
+    public CharSequence readCharSequence(int length, Charset charset) {
+        CharSequence sequence = getCharSequence(readerIndex, length, charset);
+        readerIndex += length;
+        return sequence;
+    }
+
+    @Override
     public ByteBuf setByte(int index, int value) {
         checkIndex(index);
         _setByte(index, value);
@@ -650,6 +666,23 @@ public abstract class AbstractByteBuf extends ByteBuf {
     }
 
     @Override
+    public int setCharSequence(int index, CharSequence sequence, Charset charset) {
+        if (charset.equals(CharsetUtil.UTF_8)) {
+            ensureWritable(ByteBufUtil.utf8MaxBytes(sequence));
+            return ByteBufUtil.writeUtf8(this, index, sequence, sequence.length());
+        }
+        if (charset.equals(CharsetUtil.US_ASCII)) {
+            int len = sequence.length();
+            ensureWritable(len);
+            return ByteBufUtil.writeAscii(this, index, sequence, len);
+        }
+        byte[] bytes = sequence.toString().getBytes(charset);
+        ensureWritable(bytes.length);
+        setBytes(index, bytes);
+        return bytes.length;
+    }
+
+    @Override
     public byte readByte() {
         checkReadableBytes0(1);
         int i = readerIndex;
@@ -801,6 +834,13 @@ public abstract class AbstractByteBuf extends ByteBuf {
     @Override
     public ByteBuf readSlice(int length) {
         ByteBuf slice = slice(readerIndex, length);
+        readerIndex += length;
+        return slice;
+    }
+
+    @Override
+    public ByteBuf readRetainedSlice(int length) {
+        ByteBuf slice = retainedSlice(readerIndex, length);
         readerIndex += length;
         return slice;
     }
@@ -1112,6 +1152,13 @@ public abstract class AbstractByteBuf extends ByteBuf {
     }
 
     @Override
+    public int writeCharSequence(CharSequence sequence, Charset charset) {
+        int written = setCharSequence(writerIndex, sequence, charset);
+        writerIndex += written;
+        return written;
+    }
+
+    @Override
     public ByteBuf copy() {
         return copy(readerIndex, readableBytes());
     }
@@ -1122,13 +1169,28 @@ public abstract class AbstractByteBuf extends ByteBuf {
     }
 
     @Override
+    public ByteBuf retainedDuplicate() {
+        return duplicate().retain();
+    }
+
+    @Override
     public ByteBuf slice() {
         return slice(readerIndex, readableBytes());
     }
 
     @Override
+    public ByteBuf retainedSlice() {
+        return slice().retain();
+    }
+
+    @Override
     public ByteBuf slice(int index, int length) {
         return new SlicedAbstractByteBuf(this, index, length);
+    }
+
+    @Override
+    public ByteBuf retainedSlice(int index, int length) {
+        return slice(index, length).retain();
     }
 
     @Override

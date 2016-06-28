@@ -23,7 +23,9 @@ import io.netty.handler.codec.DefaultHeaders;
 import io.netty.util.AsciiString;
 import io.netty.util.ByteProcessor;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.UnstableApi;
 
+@UnstableApi
 public class DefaultHttp2Headers
         extends DefaultHeaders<CharSequence, CharSequence, Http2Headers> implements Http2Headers {
     private static final ByteProcessor HTTP2_NAME_VALIDATOR_PROCESSOR = new ByteProcessor() {
@@ -35,6 +37,10 @@ public class DefaultHttp2Headers
     private static final NameValidator<CharSequence> HTTP2_NAME_VALIDATOR = new NameValidator<CharSequence>() {
         @Override
         public void validateName(CharSequence name) {
+            if (name == null || name.length() == 0) {
+                PlatformDependent.throwException(connectionError(PROTOCOL_ERROR,
+                        "empty headers are not allowed [%s]", name));
+            }
             if (name instanceof AsciiString) {
                 final int index;
                 try {

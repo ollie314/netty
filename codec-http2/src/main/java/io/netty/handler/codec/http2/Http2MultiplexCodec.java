@@ -24,8 +24,6 @@ import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelHandlerInvoker;
-import io.netty.channel.ChannelHandlerInvokerUtil;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
@@ -33,7 +31,7 @@ import io.netty.handler.codec.UnsupportedMessageTypeException;
 import io.netty.handler.codec.http.HttpServerUpgradeHandler.UpgradeEvent;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.EventExecutor;
-import io.netty.util.internal.OneTimeTask;
+import io.netty.util.internal.UnstableApi;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -71,6 +69,7 @@ import java.util.List;
  * <p>{@link ChannelConfig#setMaxMessagesPerRead(int)} and {@link
  * ChannelConfig#setAutoRead(boolean)} are supported.
  */
+@UnstableApi
 public final class Http2MultiplexCodec extends ChannelDuplexHandler {
     private static final Http2FrameLogger HTTP2_FRAME_LOGGER = new Http2FrameLogger(INFO, Http2MultiplexCodec.class);
 
@@ -81,6 +80,7 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
     private final List<StreamInfo> streamsToFireChildReadComplete = new ArrayList<StreamInfo>();
     private ChannelHandlerContext ctx;
     private ChannelHandlerContext http2HandlerCtx;
+    private volatile Runnable flushTask;
 
     /**
      * Construct a new handler whose child channels run in the same event loop as this handler.
@@ -174,15 +174,74 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
         }
     }
 
+    // Override this to signal it will never throw an exception.
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        ctx.fireExceptionCaught(cause);
+    }
+
+    // Override this to signal it will never throw an exception.
+    @Override
+    public void flush(ChannelHandlerContext ctx) {
+        ctx.flush();
+    }
+
+    void flushFromStreamChannel() {
+        EventExecutor executor = ctx.executor();
+        if (executor.inEventLoop()) {
+            flush(ctx);
+        } else {
+            Runnable task = flushTask;
+            if (task == null) {
+                task = flushTask = new Runnable() {
+                    @Override
+                    public void run() {
+                        flush(ctx);
+                    }
+                };
+            }
+            executor.execute(task);
+        }
+    }
+
+    void writeFromStreamChannel(final Object msg, final boolean flush) {
+        final ChannelPromise promise = ctx.newPromise();
+        EventExecutor executor = ctx.executor();
+        if (executor.inEventLoop()) {
+            writeFromStreamChannel0(msg, flush, promise);
+        } else {
+            try {
+                executor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        writeFromStreamChannel0(msg, flush, promise);
+                    }
+                });
+            } catch (Throwable cause) {
+                promise.setFailure(cause);
+            }
+        }
+    }
+
+    private void writeFromStreamChannel0(Object msg, boolean flush, ChannelPromise promise) {
+        try {
+            write(ctx, msg, promise);
+        } catch (Throwable cause) {
+            promise.tryFailure(cause);
+        }
+        if (flush) {
+            flush(ctx);
+        }
+    }
+
     /**
      * Processes all {@link Http2Frame}s. {@link Http2StreamFrame}s may only originate in child
      * streams.
      */
     @Override
-    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise)
-            throws Exception {
+    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
         if (!(msg instanceof Http2Frame)) {
-            super.write(ctx, msg, promise);
+            ctx.write(msg, promise);
             return;
         }
         try {
@@ -278,13 +337,13 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
 
         @Override
         public void onStreamClosed(Http2Stream stream) {
-            final StreamInfo streamInfo = (StreamInfo) stream.getProperty(streamInfoKey);
+            final StreamInfo streamInfo = stream.getProperty(streamInfoKey);
             if (streamInfo != null) {
                 final EventLoop eventLoop = streamInfo.childChannel.eventLoop();
                 if (eventLoop.inEventLoop()) {
                     onStreamClosed0(streamInfo);
                 } else {
-                    eventLoop.execute(new OneTimeTask() {
+                    eventLoop.execute(new Runnable() {
                         @Override
                         public void run() {
                             onStreamClosed0(streamInfo);
@@ -311,20 +370,30 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
                             StreamInfo streamInfo = (StreamInfo) stream.getProperty(streamInfoKey);
                             // TODO: Can we force a user interaction pattern that doesn't require us to duplicate()?
                             // https://github.com/netty/netty/issues/4943
-                            streamInfo.childChannel.pipeline().fireUserEventTriggered(goAway.duplicate().retain());
+                            streamInfo.childChannel.pipeline().fireUserEventTriggered(goAway.retainedDuplicate());
                         }
                         return true;
                     }
                 });
-            } catch (Throwable t) {
-                ctx.invoker().invokeExceptionCaught(ctx, t);
+            } catch (final Throwable t) {
+                EventExecutor executor = ctx.executor();
+                if (executor.inEventLoop()) {
+                    exceptionCaught(ctx, t);
+                } else {
+                    executor.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            exceptionCaught(ctx, t);
+                        }
+                    });
+                }
             }
-            ctx.fireUserEventTriggered(goAway.duplicate().retain());
+            ctx.fireUserEventTriggered(goAway.retainedDuplicate());
         }
     }
 
     class InternalHttp2ConnectionHandler extends Http2ConnectionHandler {
-        public InternalHttp2ConnectionHandler(Http2ConnectionDecoder decoder, Http2ConnectionEncoder encoder,
+        InternalHttp2ConnectionHandler(Http2ConnectionDecoder decoder, Http2ConnectionEncoder encoder,
                 Http2Settings initialSettings) {
             super(decoder, encoder, initialSettings);
         }
@@ -337,7 +406,7 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
                 if (stream == null) {
                     return;
                 }
-                StreamInfo streamInfo = (StreamInfo) stream.getProperty(streamInfoKey);
+                StreamInfo streamInfo = stream.getProperty(streamInfoKey);
                 if (streamInfo == null) {
                     return;
                 }
@@ -353,7 +422,7 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
         public void onRstStreamRead(ChannelHandlerContext ctx, int streamId, long errorCode)
                 throws Http2Exception {
             Http2Stream stream = http2Handler.connection().stream(streamId);
-            StreamInfo streamInfo = (StreamInfo) stream.getProperty(streamInfoKey);
+            StreamInfo streamInfo = stream.getProperty(streamInfoKey);
             // Use a user event in order to circumvent read queue.
             streamInfo.childChannel.pipeline().fireUserEventTriggered(new DefaultHttp2ResetFrame(errorCode));
         }
@@ -369,7 +438,7 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
         public void onHeadersRead(ChannelHandlerContext ctx, int streamId, Http2Headers headers,
                 int padding, boolean endOfStream) throws Http2Exception {
             Http2Stream stream = http2Handler.connection().stream(streamId);
-            StreamInfo streamInfo = (StreamInfo) stream.getProperty(streamInfoKey);
+            StreamInfo streamInfo = stream.getProperty(streamInfoKey);
             fireChildReadAndRegister(streamInfo, new DefaultHttp2HeadersFrame(headers, endOfStream, padding));
         }
 
@@ -377,7 +446,7 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
         public int onDataRead(ChannelHandlerContext ctx, int streamId, ByteBuf data, int padding,
                 boolean endOfStream) throws Http2Exception {
             Http2Stream stream = http2Handler.connection().stream(streamId);
-            StreamInfo streamInfo = (StreamInfo) stream.getProperty(streamInfoKey);
+            StreamInfo streamInfo = stream.getProperty(streamInfoKey);
             fireChildReadAndRegister(streamInfo, new DefaultHttp2DataFrame(data.retain(), endOfStream, padding));
             // We return the bytes in bytesConsumed() once the stream channel consumed the bytes.
             return 0;
@@ -387,7 +456,7 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
     static final class StreamInfo {
         final Http2StreamChannel childChannel;
         /**
-         * {@code true} if stream is in {@link Http2MultiplexCodec#steamsToFireChildReadComplete}.
+         * {@code true} if stream is in {@link Http2MultiplexCodec#streamsToFireChildReadComplete}.
          */
         boolean inStreamsToFireChildReadComplete;
 
@@ -411,9 +480,7 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
         protected void doClose() throws Exception {
             if (!onStreamClosedFired) {
                 Http2StreamFrame resetFrame = new DefaultHttp2ResetFrame(Http2Error.CANCEL).setStream(this);
-                ChannelHandlerInvoker invoker = ctx.invoker();
-                invoker.invokeWrite(ctx, resetFrame, ctx.newPromise());
-                invoker.invokeFlush(ctx);
+                writeFromStreamChannel(resetFrame, true);
             }
             super.doClose();
         }
@@ -430,12 +497,13 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
                 throw new IllegalArgumentException("Stream must be null on the frame");
             }
             frame.setStream(this);
-            ctx.invoker().invokeWrite(ctx, frame, ctx.newPromise());
+
+            writeFromStreamChannel(msg, false);
         }
 
         @Override
         protected void doWriteComplete() {
-            ctx.invoker().invokeFlush(ctx);
+            flushFromStreamChannel();
         }
 
         @Override
@@ -449,7 +517,7 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
             if (executor.inEventLoop()) {
                 bytesConsumed0(bytes);
             } else {
-                executor.execute(new OneTimeTask() {
+                executor.execute(new Runnable() {
                     @Override
                     public void run() {
                         bytesConsumed0(bytes);
@@ -462,7 +530,7 @@ public final class Http2MultiplexCodec extends ChannelDuplexHandler {
             try {
                 http2Handler.connection().local().flowController().consumeBytes(stream, bytes);
             } catch (Throwable t) {
-                ChannelHandlerInvokerUtil.invokeExceptionCaughtNow(ctx, t);
+                exceptionCaught(ctx, t);
             }
         }
     }

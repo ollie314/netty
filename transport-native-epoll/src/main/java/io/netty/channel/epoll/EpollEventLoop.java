@@ -24,6 +24,7 @@ import io.netty.channel.unix.FileDescriptor;
 import io.netty.util.IntSupplier;
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
+import io.netty.util.concurrent.RejectedExecutionHandler;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.logging.InternalLogger;
@@ -33,6 +34,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Queue;
+import java.util.concurrent.Callable;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
@@ -65,12 +67,18 @@ final class EpollEventLoop extends SingleThreadEventLoop {
             return Native.epollWait(epollFd.intValue(), events, 0);
         }
     };
-
+    private final Callable<Integer> pendingTasksCallable = new Callable<Integer>() {
+        @Override
+        public Integer call() throws Exception {
+            return EpollEventLoop.super.pendingTasks();
+        }
+    };
     private volatile int wakenUp;
     private volatile int ioRatio = 50;
 
-    EpollEventLoop(EventLoopGroup parent, Executor executor, int maxEvents, SelectStrategy strategy) {
-        super(parent, executor, false);
+    EpollEventLoop(EventLoopGroup parent, Executor executor, int maxEvents,
+                   SelectStrategy strategy, RejectedExecutionHandler rejectedExecutionHandler) {
+        super(parent, executor, false, DEFAULT_MAX_PENDING_TASKS, rejectedExecutionHandler);
         selectStrategy = ObjectUtil.checkNotNull(strategy, "strategy");
         if (maxEvents == 0) {
             allowGrowing = true;
@@ -128,7 +136,7 @@ final class EpollEventLoop extends SingleThreadEventLoop {
     }
 
     /**
-     * Register the given epoll with this {@link io.netty.channel.EventLoop}.
+     * Register the given epoll with this {@link EventLoop}.
      */
     void add(AbstractEpollChannel ch) throws IOException {
         assert inEventLoop();
@@ -162,11 +170,22 @@ final class EpollEventLoop extends SingleThreadEventLoop {
     }
 
     @Override
-    protected Queue<Runnable> newTaskQueue() {
+    protected Queue<Runnable> newTaskQueue(int maxPendingTasks) {
         // This event loop never calls takeTask()
-        return PlatformDependent.newMpscQueue();
+        return PlatformDependent.newMpscQueue(maxPendingTasks);
     }
 
+    @Override
+    public int pendingTasks() {
+        // As we use a MpscQueue we need to ensure pendingTasks() is only executed from within the EventLoop as
+        // otherwise we may see unexpected behavior (as size() is only allowed to be called by a single consumer).
+        // See https://github.com/netty/netty/issues/5297
+        if (inEventLoop()) {
+            return super.pendingTasks();
+        } else {
+            return submit(pendingTasksCallable).syncUninterruptibly().getNow();
+        }
+    }
     /**
      * Returns the percentage of the desired amount of time spent for I/O in the event loop.
      */
@@ -199,6 +218,14 @@ final class EpollEventLoop extends SingleThreadEventLoop {
                     }
                 }
                 break;
+            }
+
+            // If a task was submitted when wakenUp value was 1, the task didn't get a chance to produce wakeup event.
+            // So we need to check task queue again before calling epoll_wait. If we don't, the task might be pended
+            // until epoll_wait was timed out. It might be pended until idle timeout if IdleStateHandler existed
+            // in pipeline.
+            if (hasTasks() && WAKEN_UP_UPDATER.compareAndSet(this, 0, 1)) {
+                return Native.epollWait(epollFd.intValue(), events, 0);
             }
 
             int selectedKeys = Native.epollWait(epollFd.intValue(), events, (int) timeoutMillis);

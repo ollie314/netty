@@ -32,10 +32,10 @@ import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpRequestEncoder;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseDecoder;
+import io.netty.handler.codec.http.HttpScheme;
 import io.netty.util.ReferenceCountUtil;
-import io.netty.util.internal.EmptyArrays;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.StringUtil;
+import io.netty.util.internal.ThrowableUtil;
 
 import java.net.URI;
 import java.nio.channels.ClosedChannelException;
@@ -44,11 +44,8 @@ import java.nio.channels.ClosedChannelException;
  * Base class for web socket client handshake implementations
  */
 public abstract class WebSocketClientHandshaker {
-    private static final ClosedChannelException CLOSED_CHANNEL_EXCEPTION = new ClosedChannelException();
-
-    static {
-        CLOSED_CHANNEL_EXCEPTION.setStackTrace(EmptyArrays.EMPTY_STACK_TRACE);
-    }
+    private static final ClosedChannelException CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
+            new ClosedChannelException(), WebSocketClientHandshaker.class, "processHandshake(...)");
 
     private final URI uri;
 
@@ -273,7 +270,7 @@ public abstract class WebSocketClientHandshaker {
             // Delay the removal of the decoder so the user can setup the pipeline if needed to handle
             // WebSocketFrame messages.
             // See https://github.com/netty/netty/issues/4533
-            channel.eventLoop().execute(new OneTimeTask() {
+            channel.eventLoop().execute(new Runnable() {
                 @Override
                 public void run() {
                     p.remove(codec);
@@ -290,7 +287,7 @@ public abstract class WebSocketClientHandshaker {
             // Delay the removal of the decoder so the user can setup the pipeline if needed to handle
             // WebSocketFrame messages.
             // See https://github.com/netty/netty/issues/4533
-            channel.eventLoop().execute(new OneTimeTask() {
+            channel.eventLoop().execute(new Runnable() {
                 @Override
                 public void run() {
                     p.remove(context.handler());
@@ -444,5 +441,27 @@ public abstract class WebSocketClientHandshaker {
         }
 
         return path == null || path.isEmpty() ? "/" : path;
+    }
+
+    static int websocketPort(URI wsURL) {
+        // Format request
+        int wsPort = wsURL.getPort();
+        // check if the URI contained a port if not set the correct one depending on the schema.
+        // See https://github.com/netty/netty/pull/1558
+        if (wsPort == -1) {
+            return "wss".equals(wsURL.getScheme()) ? HttpScheme.HTTPS.port() : HttpScheme.HTTP.port();
+        }
+        return wsPort;
+    }
+
+    static CharSequence websocketOriginValue(String host, int wsPort) {
+        String originValue = (wsPort == HttpScheme.HTTPS.port() ?
+                HttpScheme.HTTPS.name() : HttpScheme.HTTP.name()) + "://" + host;
+        if (wsPort != HttpScheme.HTTP.port() && wsPort != HttpScheme.HTTPS.port()) {
+            // if the port is not standard (80/443) its needed to add the port to the header.
+            // See http://tools.ietf.org/html/rfc6454#section-6.2
+            return originValue + ':' + wsPort;
+        }
+        return originValue;
     }
 }

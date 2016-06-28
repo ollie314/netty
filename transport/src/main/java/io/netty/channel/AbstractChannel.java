@@ -18,9 +18,8 @@ package io.netty.channel;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.util.DefaultAttributeMap;
 import io.netty.util.ReferenceCountUtil;
-import io.netty.util.internal.EmptyArrays;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.ThrowableUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -42,22 +41,21 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(AbstractChannel.class);
 
-    static final ClosedChannelException CLOSED_CHANNEL_EXCEPTION = new ClosedChannelException();
-    static final NotYetConnectedException NOT_YET_CONNECTED_EXCEPTION = new NotYetConnectedException();
-
-    static {
-        CLOSED_CHANNEL_EXCEPTION.setStackTrace(EmptyArrays.EMPTY_STACK_TRACE);
-        NOT_YET_CONNECTED_EXCEPTION.setStackTrace(EmptyArrays.EMPTY_STACK_TRACE);
-    }
-
-    private MessageSizeEstimator.Handle estimatorHandle;
+    private static final ClosedChannelException FLUSH0_CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
+            new ClosedChannelException(), AbstractUnsafe.class, "flush0()");
+    private static final ClosedChannelException ENSURE_OPEN_CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
+            new ClosedChannelException(), AbstractUnsafe.class, "ensureOpen(...)");
+    private static final ClosedChannelException CLOSE_CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
+            new ClosedChannelException(), AbstractUnsafe.class, "close(...)");
+    private static final ClosedChannelException WRITE_CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
+            new ClosedChannelException(), AbstractUnsafe.class, "write(...)");
+    private static final NotYetConnectedException FLUSH0_NOT_YET_CONNECTED_EXCEPTION = ThrowableUtil.unknownStackTrace(
+            new NotYetConnectedException(), AbstractUnsafe.class, "flush0()");
 
     private final Channel parent;
     private final ChannelId id;
     private final Unsafe unsafe;
     private final DefaultChannelPipeline pipeline;
-    private final ChannelFuture succeededFuture = new SucceededChannelFuture(this, null);
-    private final VoidChannelPromise voidPromise = new VoidChannelPromise(this, true);
     private final VoidChannelPromise unsafeVoidPromise = new VoidChannelPromise(this, false);
     private final CloseFuture closeFuture = new CloseFuture(this);
 
@@ -80,7 +78,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         this.parent = parent;
         id = newId();
         unsafe = newUnsafe();
-        pipeline = new DefaultChannelPipeline(this);
+        pipeline = newChannelPipeline();
     }
 
     /**
@@ -93,7 +91,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         this.parent = parent;
         this.id = id;
         unsafe = newUnsafe();
-        pipeline = new DefaultChannelPipeline(this);
+        pipeline = newChannelPipeline();
     }
 
     @Override
@@ -107,6 +105,13 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
      */
     protected ChannelId newId() {
         return DefaultChannelId.newInstance();
+    }
+
+    /**
+     * Returns a new {@link DefaultChannelPipeline} instance.
+     */
+    protected DefaultChannelPipeline newChannelPipeline() {
+        return new DefaultChannelPipeline(this);
     }
 
     @Override
@@ -293,22 +298,22 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
     @Override
     public ChannelPromise newPromise() {
-        return new DefaultChannelPromise(this);
+        return pipeline.newPromise();
     }
 
     @Override
     public ChannelProgressivePromise newProgressivePromise() {
-        return new DefaultChannelProgressivePromise(this);
+        return pipeline.newProgressivePromise();
     }
 
     @Override
     public ChannelFuture newSucceededFuture() {
-        return succeededFuture;
+        return pipeline.newSucceededFuture();
     }
 
     @Override
     public ChannelFuture newFailedFuture(Throwable cause) {
-        return new FailedChannelFuture(this, null, cause);
+        return pipeline.newFailedFuture(cause);
     }
 
     @Override
@@ -400,14 +405,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
     @Override
     public final ChannelPromise voidPromise() {
-        return voidPromise;
-    }
-
-    final MessageSizeEstimator.Handle estimatorHandle() {
-        if (estimatorHandle == null) {
-            estimatorHandle = config().getMessageSizeEstimator().newHandle();
-        }
-        return estimatorHandle;
+        return pipeline.voidPromise();
     }
 
     /**
@@ -431,11 +429,6 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                 recvHandle = config().getRecvByteBufAllocator().newHandle();
             }
             return recvHandle;
-        }
-
-        @Override
-        public final ChannelHandlerInvoker invoker() {
-            return eventLoop().asInvoker();
         }
 
         @Override
@@ -474,7 +467,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                 register0(promise);
             } else {
                 try {
-                    eventLoop.execute(new OneTimeTask() {
+                    eventLoop.execute(new Runnable() {
                         @Override
                         public void run() {
                             register0(promise);
@@ -502,12 +495,6 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                 doRegister();
                 neverRegistered = false;
                 registered = true;
-
-                if (firstRegistration) {
-                    // We are now registered to the EventLoop. It's time to call the callbacks for the ChannelHandlers,
-                    // that were added before the registration was done.
-                    pipeline.callHandlerAddedForAllHandlers();
-                }
 
                 safeSetSuccess(promise);
                 pipeline.fireChannelRegistered();
@@ -563,7 +550,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             }
 
             if (!wasActive && isActive()) {
-                invokeLater(new OneTimeTask() {
+                invokeLater(new Runnable() {
                     @Override
                     public void run() {
                         pipeline.fireChannelActive();
@@ -592,7 +579,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             }
 
             if (wasActive && !isActive()) {
-                invokeLater(new OneTimeTask() {
+                invokeLater(new Runnable() {
                     @Override
                     public void run() {
                         pipeline.fireChannelInactive();
@@ -608,10 +595,11 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         public final void close(final ChannelPromise promise) {
             assertEventLoop();
 
-            close(promise, CLOSED_CHANNEL_EXCEPTION, false);
+            close(promise, CLOSE_CLOSED_CHANNEL_EXCEPTION, CLOSE_CLOSED_CHANNEL_EXCEPTION, false);
         }
 
-        private void close(final ChannelPromise promise, final Throwable cause, final boolean notify) {
+        private void close(final ChannelPromise promise, final Throwable cause,
+                           final ClosedChannelException closeCause, final boolean notify) {
             if (!promise.setUncancellable()) {
                 return;
             }
@@ -641,7 +629,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             this.outboundBuffer = null; // Disallow adding any messages and flushes to outboundBuffer.
             Executor closeExecutor = prepareToClose();
             if (closeExecutor != null) {
-                closeExecutor.execute(new OneTimeTask() {
+                closeExecutor.execute(new Runnable() {
                     @Override
                     public void run() {
                         try {
@@ -649,12 +637,12 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                             doClose0(promise);
                         } finally {
                             // Call invokeLater so closeAndDeregister is executed in the EventLoop again!
-                            invokeLater(new OneTimeTask() {
+                            invokeLater(new Runnable() {
                                 @Override
                                 public void run() {
                                     // Fail all the queued messages
                                     outboundBuffer.failFlushed(cause, notify);
-                                    outboundBuffer.close(CLOSED_CHANNEL_EXCEPTION);
+                                    outboundBuffer.close(closeCause);
                                     fireChannelInactiveAndDeregister(wasActive);
                                 }
                             });
@@ -668,10 +656,10 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                 } finally {
                     // Fail all the queued messages.
                     outboundBuffer.failFlushed(cause, notify);
-                    outboundBuffer.close(CLOSED_CHANNEL_EXCEPTION);
+                    outboundBuffer.close(closeCause);
                 }
                 if (inFlush0) {
-                    invokeLater(new OneTimeTask() {
+                    invokeLater(new Runnable() {
                         @Override
                         public void run() {
                             fireChannelInactiveAndDeregister(wasActive);
@@ -735,7 +723,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             //
             // See:
             // https://github.com/netty/netty/issues/4435
-            invokeLater(new OneTimeTask() {
+            invokeLater(new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -771,7 +759,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             try {
                 doBeginRead();
             } catch (final Exception e) {
-                invokeLater(new OneTimeTask() {
+                invokeLater(new Runnable() {
                     @Override
                     public void run() {
                         pipeline.fireExceptionCaught(e);
@@ -791,7 +779,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                 // need to fail the future right away. If it is not null the handling of the rest
                 // will be done in flush0()
                 // See https://github.com/netty/netty/issues/2362
-                safeSetFailure(promise, CLOSED_CHANNEL_EXCEPTION);
+                safeSetFailure(promise, WRITE_CLOSED_CHANNEL_EXCEPTION);
                 // release message now to prevent resource-leak
                 ReferenceCountUtil.release(msg);
                 return;
@@ -800,7 +788,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             int size;
             try {
                 msg = filterOutboundMessage(msg);
-                size = estimatorHandle().size(msg);
+                size = pipeline.estimatorHandle().size(msg);
                 if (size < 0) {
                     size = 0;
                 }
@@ -844,10 +832,10 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             if (!isActive()) {
                 try {
                     if (isOpen()) {
-                        outboundBuffer.failFlushed(NOT_YET_CONNECTED_EXCEPTION, true);
+                        outboundBuffer.failFlushed(FLUSH0_NOT_YET_CONNECTED_EXCEPTION, true);
                     } else {
                         // Do not trigger channelWritabilityChanged because the channel is closed already.
-                        outboundBuffer.failFlushed(CLOSED_CHANNEL_EXCEPTION, false);
+                        outboundBuffer.failFlushed(FLUSH0_CLOSED_CHANNEL_EXCEPTION, false);
                     }
                 } finally {
                     inFlush0 = false;
@@ -867,7 +855,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                      * This is needed as otherwise {@link #isActive()} , {@link #isOpen()} and {@link #isWritable()}
                      * may still return {@code true} even if the channel should be closed as result of the exception.
                      */
-                    close(voidPromise(), t, false);
+                    close(voidPromise(), t, FLUSH0_CLOSED_CHANNEL_EXCEPTION, false);
                 } else {
                     outboundBuffer.failFlushed(t, true);
                 }
@@ -883,12 +871,13 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             return unsafeVoidPromise;
         }
 
+        @Deprecated
         protected final boolean ensureOpen(ChannelPromise promise) {
             if (isOpen()) {
                 return true;
             }
 
-            safeSetFailure(promise, CLOSED_CHANNEL_EXCEPTION);
+            safeSetFailure(promise, ENSURE_OPEN_CLOSED_CHANNEL_EXCEPTION);
             return false;
         }
 

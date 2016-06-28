@@ -15,8 +15,10 @@
 
 package io.netty.handler.codec.redis;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufHolder;
 import io.netty.channel.ChannelPipeline;
+import io.netty.util.internal.UnstableApi;
 
 /**
  * A chunk of bulk strings which is used for Redis chunked transfer-encoding.
@@ -25,5 +27,30 @@ import io.netty.channel.ChannelPipeline;
  * If you prefer not to receive {@link BulkStringRedisContent} in your handler,
  * place {@link RedisBulkStringAggregator} after {@link RedisDecoder} in the {@link ChannelPipeline}.
  */
+@UnstableApi
 public interface BulkStringRedisContent extends RedisMessage, ByteBufHolder {
+
+    @Override
+    BulkStringRedisContent copy();
+
+    @Override
+    BulkStringRedisContent duplicate();
+
+    @Override
+    BulkStringRedisContent retainedDuplicate();
+
+    @Override
+    BulkStringRedisContent replace(ByteBuf content);
+
+    @Override
+    BulkStringRedisContent retain();
+
+    @Override
+    BulkStringRedisContent retain(int increment);
+
+    @Override
+    BulkStringRedisContent touch();
+
+    @Override
+    BulkStringRedisContent touch(Object hint);
 }

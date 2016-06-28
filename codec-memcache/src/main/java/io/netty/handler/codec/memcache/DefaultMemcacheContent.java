@@ -17,10 +17,12 @@ package io.netty.handler.codec.memcache;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.util.internal.StringUtil;
+import io.netty.util.internal.UnstableApi;
 
 /**
  * The default {@link MemcacheContent} implementation.
  */
+@UnstableApi
 public class DefaultMemcacheContent extends AbstractMemcacheObject implements MemcacheContent {
 
     private final ByteBuf content;
@@ -42,12 +44,22 @@ public class DefaultMemcacheContent extends AbstractMemcacheObject implements Me
 
     @Override
     public MemcacheContent copy() {
-        return new DefaultMemcacheContent(content.copy());
+        return replace(content.copy());
     }
 
     @Override
     public MemcacheContent duplicate() {
-        return new DefaultMemcacheContent(content.duplicate());
+        return replace(content.duplicate());
+    }
+
+    @Override
+    public MemcacheContent retainedDuplicate() {
+        return replace(content.retainedDuplicate());
+    }
+
+    @Override
+    public MemcacheContent replace(ByteBuf content) {
+        return new DefaultMemcacheContent(content);
     }
 
     @Override

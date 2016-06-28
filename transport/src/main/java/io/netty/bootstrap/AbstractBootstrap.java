@@ -29,12 +29,12 @@ import io.netty.channel.ReflectiveChannelFactory;
 import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.GlobalEventExecutor;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.StringUtil;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -303,9 +303,10 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
                     } else {
                         // Registration was successful, so set the correct executor to use.
                         // See https://github.com/netty/netty/issues/2586
-                        promise.executor = channel.eventLoop();
+                        promise.registered();
+
+                        doBind0(regFuture, channel, localAddress, promise);
                     }
-                    doBind0(regFuture, channel, localAddress, promise);
                 }
             });
             return promise;
@@ -313,16 +314,20 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 
     final ChannelFuture initAndRegister() {
-        final Channel channel = channelFactory().newChannel();
+        Channel channel = null;
         try {
+            channel = channelFactory.newChannel();
             init(channel);
         } catch (Throwable t) {
-            channel.unsafe().closeForcibly();
+            if (channel != null) {
+                // channel can be null if newChannel crashed (eg SocketException("too many open files"))
+                channel.unsafe().closeForcibly();
+            }
             // as the Channel is not registered yet we need to force the usage of the GlobalEventExecutor
             return new DefaultChannelPromise(channel, GlobalEventExecutor.INSTANCE).setFailure(t);
         }
 
-        ChannelFuture regFuture = group().register(channel);
+        ChannelFuture regFuture = config().group().register(channel);
         if (regFuture.cause() != null) {
             if (channel.isRegistered()) {
                 channel.close();
@@ -351,7 +356,7 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
 
         // This method is invoked before channelRegistered() is triggered.  Give user handlers a chance to set up
         // the pipeline in its channelRegistered() implementation.
-        channel.eventLoop().execute(new OneTimeTask() {
+        channel.eventLoop().execute(new Runnable() {
             @Override
             public void run() {
                 if (regFuture.isSuccess()) {
@@ -375,6 +380,41 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
         return (B) this;
     }
 
+    /**
+     * Returns the configured {@link EventLoopGroup} or {@code null} if non is configured yet.
+     *
+     * @deprecated Use {@link #config()} instead.
+     */
+    @Deprecated
+    public final EventLoopGroup group() {
+        return group;
+    }
+
+    /**
+     * Returns the {@link AbstractBootstrapConfig} object that can be used to obtain the current config
+     * of the bootstrap.
+     */
+    public abstract AbstractBootstrapConfig<B, C> config();
+
+    static <K, V> Map<K, V> copiedMap(Map<K, V> map) {
+        final Map<K, V> copied;
+        synchronized (map) {
+            if (map.isEmpty()) {
+                return Collections.emptyMap();
+            }
+            copied = new LinkedHashMap<K, V>(map);
+        }
+        return Collections.unmodifiableMap(copied);
+    }
+
+    final Map<ChannelOption<?>, Object> options0() {
+        return options;
+    }
+
+    final Map<AttributeKey<?>, Object> attrs0() {
+        return attrs;
+    }
+
     final SocketAddress localAddress() {
         return localAddress;
     }
@@ -388,86 +428,43 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
         return handler;
     }
 
-    /**
-     * Return the configured {@link EventLoopGroup} or {@code null} if non is configured yet.
-     */
-    public EventLoopGroup group() {
-        return group;
-    }
-
     final Map<ChannelOption<?>, Object> options() {
-        return options;
+        return copiedMap(options);
     }
 
     final Map<AttributeKey<?>, Object> attrs() {
-        return attrs;
+        return copiedMap(attrs);
     }
 
     @Override
     public String toString() {
         StringBuilder buf = new StringBuilder()
             .append(StringUtil.simpleClassName(this))
-            .append('(');
-        if (group != null) {
-            buf.append("group: ")
-               .append(StringUtil.simpleClassName(group))
-               .append(", ");
-        }
-        if (channelFactory != null) {
-            buf.append("channelFactory: ")
-               .append(channelFactory)
-               .append(", ");
-        }
-        if (localAddress != null) {
-            buf.append("localAddress: ")
-               .append(localAddress)
-               .append(", ");
-        }
-        synchronized (options) {
-            if (!options.isEmpty()) {
-                buf.append("options: ")
-                   .append(options)
-                   .append(", ");
-            }
-        }
-        synchronized (attrs) {
-            if (!attrs.isEmpty()) {
-                buf.append("attrs: ")
-                   .append(attrs)
-                   .append(", ");
-            }
-        }
-        if (handler != null) {
-            buf.append("handler: ")
-               .append(handler)
-               .append(", ");
-        }
-        if (buf.charAt(buf.length() - 1) == '(') {
-            buf.append(')');
-        } else {
-            buf.setCharAt(buf.length() - 2, ')');
-            buf.setLength(buf.length() - 1);
-        }
+            .append('(').append(config()).append(')');
         return buf.toString();
     }
 
-    private static final class PendingRegistrationPromise extends DefaultChannelPromise {
+    static final class PendingRegistrationPromise extends DefaultChannelPromise {
+
         // Is set to the correct EventExecutor once the registration was successful. Otherwise it will
         // stay null and so the GlobalEventExecutor.INSTANCE will be used for notifications.
-        private volatile EventExecutor executor;
+        private volatile boolean registered;
 
-        private PendingRegistrationPromise(Channel channel) {
+        PendingRegistrationPromise(Channel channel) {
             super(channel);
+        }
+
+        void registered() {
+            registered = true;
         }
 
         @Override
         protected EventExecutor executor() {
-            EventExecutor executor = this.executor;
-            if (executor != null) {
+            if (registered) {
                 // If the registration was a success executor is set.
                 //
                 // See https://github.com/netty/netty/issues/2586
-                return executor;
+                return super.executor();
             }
             // The registration failed so we can only use the GlobalEventExecutor as last resort to notify.
             return GlobalEventExecutor.INSTANCE;

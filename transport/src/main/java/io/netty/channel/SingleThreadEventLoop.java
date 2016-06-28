@@ -15,7 +15,11 @@
  */
 package io.netty.channel;
 
+import io.netty.util.concurrent.RejectedExecutionHandler;
+import io.netty.util.concurrent.RejectedExecutionHandlers;
 import io.netty.util.concurrent.SingleThreadEventExecutor;
+import io.netty.util.internal.ObjectUtil;
+import io.netty.util.internal.SystemPropertyUtil;
 
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadFactory;
@@ -26,14 +30,27 @@ import java.util.concurrent.ThreadFactory;
  */
 public abstract class SingleThreadEventLoop extends SingleThreadEventExecutor implements EventLoop {
 
-    private final ChannelHandlerInvoker invoker = new DefaultChannelHandlerInvoker(this);
+    protected static final int DEFAULT_MAX_PENDING_TASKS = Math.max(16,
+            SystemPropertyUtil.getInt("io.netty.eventLoop.maxPendingTasks", Integer.MAX_VALUE));
 
     protected SingleThreadEventLoop(EventLoopGroup parent, ThreadFactory threadFactory, boolean addTaskWakesUp) {
-        super(parent, threadFactory, addTaskWakesUp);
+        this(parent, threadFactory, addTaskWakesUp, DEFAULT_MAX_PENDING_TASKS, RejectedExecutionHandlers.reject());
     }
 
     protected SingleThreadEventLoop(EventLoopGroup parent, Executor executor, boolean addTaskWakesUp) {
-        super(parent, executor, addTaskWakesUp);
+        this(parent, executor, addTaskWakesUp, DEFAULT_MAX_PENDING_TASKS, RejectedExecutionHandlers.reject());
+    }
+
+    protected SingleThreadEventLoop(EventLoopGroup parent, ThreadFactory threadFactory,
+                                    boolean addTaskWakesUp, int maxPendingTasks,
+                                    RejectedExecutionHandler rejectedExecutionHandler) {
+        super(parent, threadFactory, addTaskWakesUp, maxPendingTasks, rejectedExecutionHandler);
+    }
+
+    protected SingleThreadEventLoop(EventLoopGroup parent, Executor executor,
+                                    boolean addTaskWakesUp, int maxPendingTasks,
+                                    RejectedExecutionHandler rejectedExecutionHandler) {
+        super(parent, executor, addTaskWakesUp, maxPendingTasks, rejectedExecutionHandler);
     }
 
     @Override
@@ -47,15 +64,18 @@ public abstract class SingleThreadEventLoop extends SingleThreadEventExecutor im
     }
 
     @Override
-    public ChannelHandlerInvoker asInvoker() {
-        return invoker;
+    public ChannelFuture register(Channel channel) {
+        return register(new DefaultChannelPromise(channel, this));
     }
 
     @Override
-    public ChannelFuture register(Channel channel) {
-        return register(channel, new DefaultChannelPromise(channel, this));
+    public ChannelFuture register(final ChannelPromise promise) {
+        ObjectUtil.checkNotNull(promise, "promise");
+        promise.channel().unsafe().register(this, promise);
+        return promise;
     }
 
+    @Deprecated
     @Override
     public ChannelFuture register(final Channel channel, final ChannelPromise promise) {
         if (channel == null) {

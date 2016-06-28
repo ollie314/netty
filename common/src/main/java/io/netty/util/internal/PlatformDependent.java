@@ -20,6 +20,13 @@ import io.netty.util.internal.chmv8.ConcurrentHashMapV8;
 import io.netty.util.internal.chmv8.LongAdderV8;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
+import org.jctools.queues.MpscArrayQueue;
+import org.jctools.queues.MpscChunkedArrayQueue;
+import org.jctools.queues.SpscLinkedQueue;
+import org.jctools.queues.atomic.MpscAtomicArrayQueue;
+import org.jctools.queues.atomic.MpscLinkedAtomicQueue;
+import org.jctools.queues.atomic.SpscLinkedAtomicQueue;
+import org.jctools.util.Pow2;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -41,7 +48,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -53,6 +59,7 @@ import static io.netty.util.internal.PlatformDependent0.HASH_CODE_ASCII_SEED;
 import static io.netty.util.internal.PlatformDependent0.hashCodeAsciiCompute;
 import static io.netty.util.internal.PlatformDependent0.hashCodeAsciiSanitize;
 import static io.netty.util.internal.PlatformDependent0.hashCodeAsciiSanitizeAsByte;
+import static io.netty.util.internal.PlatformDependent0.unalignedAccess;
 
 /**
  * Utility that detects various properties specific to the current runtime
@@ -83,6 +90,11 @@ public final class PlatformDependent {
             HAS_UNSAFE && !SystemPropertyUtil.getBoolean("io.netty.noPreferDirect", false);
     private static final long MAX_DIRECT_MEMORY = maxDirectMemory0();
 
+    private static final int MPSC_CHUNK_SIZE =  1024;
+    private static final int MIN_MAX_MPSC_CAPACITY =  MPSC_CHUNK_SIZE * 2;
+    private static final int DEFAULT_MAX_MPSC_CAPACITY =  MPSC_CHUNK_SIZE * MPSC_CHUNK_SIZE;
+    private static final int MAX_ALLOWED_MPSC_CAPACITY = Pow2.MAX_POW2;
+
     private static final long BYTE_ARRAY_BASE_OFFSET = PlatformDependent0.byteArrayBaseOffset();
 
     private static final boolean HAS_JAVASSIST = hasJavassist0();
@@ -92,6 +104,10 @@ public final class PlatformDependent {
     private static final int BIT_MODE = bitMode0();
 
     private static final int ADDRESS_SIZE = addressSize0();
+    private static final boolean USE_DIRECT_BUFFER_NO_CLEANER;
+    private static final AtomicLong DIRECT_MEMORY_COUNTER;
+    private static final long DIRECT_MEMORY_LIMIT;
+
     public static final boolean BIG_ENDIAN_NATIVE_ORDER = ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
 
     static {
@@ -105,6 +121,34 @@ public final class PlatformDependent {
                     "Unless explicitly requested, heap buffer will always be preferred to avoid potential system " +
                     "unstability.");
         }
+
+        // Here is how the system property is used:
+        //
+        // * <  0  - Don't use cleaner, and inherit max direct memory from java. In this case the
+        //           "practical max direct memory" would be 2 * max memory as defined by the JDK.
+        // * == 0  - Use cleaner, Netty will not enforce max memory, and instead will defer to JDK.
+        // * >  0  - Don't use cleaner. This will limit Netty's total direct memory
+        //           (note: that JDK's direct memory limit is independent of this).
+        long maxDirectMemory = SystemPropertyUtil.getLong("io.netty.maxDirectMemory", -1);
+
+        if (maxDirectMemory == 0 || !hasUnsafe() || !PlatformDependent0.hasDirectBufferNoCleanerConstructor()) {
+            USE_DIRECT_BUFFER_NO_CLEANER = false;
+            DIRECT_MEMORY_COUNTER = null;
+        } else {
+            USE_DIRECT_BUFFER_NO_CLEANER = true;
+            if (maxDirectMemory < 0) {
+                maxDirectMemory = maxDirectMemory0();
+                if (maxDirectMemory <= 0) {
+                    DIRECT_MEMORY_COUNTER = null;
+                } else {
+                    DIRECT_MEMORY_COUNTER = new AtomicLong();
+                }
+            } else {
+                DIRECT_MEMORY_COUNTER = new AtomicLong();
+            }
+        }
+        DIRECT_MEMORY_LIMIT = maxDirectMemory;
+        logger.debug("io.netty.maxDirectMemory: {} bytes", maxDirectMemory);
     }
 
     /**
@@ -496,6 +540,88 @@ public final class PlatformDependent {
         PlatformDependent0.copyMemory(null, srcAddr, dst, BYTE_ARRAY_BASE_OFFSET + dstIndex, length);
     }
 
+    public static void setMemory(byte[] dst, int dstIndex, long bytes, byte value) {
+        PlatformDependent0.setMemory(dst, BYTE_ARRAY_BASE_OFFSET + dstIndex, bytes, value);
+    }
+
+    public static void setMemory(long address, long bytes, byte value) {
+        PlatformDependent0.setMemory(address, bytes, value);
+    }
+
+    /**
+     * Allocate a new {@link ByteBuffer} with the given {@code capacity}. {@link ByteBuffer}s allocated with
+     * this method <strong>MUST</strong> be deallocated via {@link #freeDirectNoCleaner(ByteBuffer)}.
+     */
+    public static ByteBuffer allocateDirectNoCleaner(int capacity) {
+        assert USE_DIRECT_BUFFER_NO_CLEANER;
+
+        incrementMemoryCounter(capacity);
+        try {
+            return PlatformDependent0.allocateDirectNoCleaner(capacity);
+        } catch (Throwable e) {
+            decrementMemoryCounter(capacity);
+            throwException(e);
+            return null;
+        }
+    }
+
+    /**
+     * Reallocate a new {@link ByteBuffer} with the given {@code capacity}. {@link ByteBuffer}s reallocated with
+     * this method <strong>MUST</strong> be deallocated via {@link #freeDirectNoCleaner(ByteBuffer)}.
+     */
+    public static ByteBuffer reallocateDirectNoCleaner(ByteBuffer buffer, int capacity) {
+        assert USE_DIRECT_BUFFER_NO_CLEANER;
+
+        int len = capacity - buffer.capacity();
+        incrementMemoryCounter(len);
+        try {
+            return PlatformDependent0.reallocateDirectNoCleaner(buffer, capacity);
+        } catch (Throwable e) {
+            decrementMemoryCounter(len);
+            throwException(e);
+            return null;
+        }
+    }
+
+    /**
+     * This method <strong>MUST</strong> only be called for {@link ByteBuffer}s that were allocated via
+     * {@link #allocateDirectNoCleaner(int)}.
+     */
+    public static void freeDirectNoCleaner(ByteBuffer buffer) {
+        assert USE_DIRECT_BUFFER_NO_CLEANER;
+
+        int capacity = buffer.capacity();
+        PlatformDependent0.freeMemory(PlatformDependent0.directBufferAddress(buffer));
+        decrementMemoryCounter(capacity);
+    }
+
+    private static void incrementMemoryCounter(int capacity) {
+        if (DIRECT_MEMORY_COUNTER != null) {
+            for (;;) {
+                long usedMemory = DIRECT_MEMORY_COUNTER.get();
+                long newUsedMemory = usedMemory + capacity;
+                if (newUsedMemory > DIRECT_MEMORY_LIMIT) {
+                    throw new OutOfDirectMemoryError("failed to allocate " + capacity
+                            + " byte(s) of direct memory (used: " + usedMemory + ", max: " + DIRECT_MEMORY_LIMIT + ')');
+                }
+                if (DIRECT_MEMORY_COUNTER.compareAndSet(usedMemory, newUsedMemory)) {
+                    break;
+                }
+            }
+        }
+    }
+
+    private static void decrementMemoryCounter(int capacity) {
+        if (DIRECT_MEMORY_COUNTER != null) {
+            long usedMemory = DIRECT_MEMORY_COUNTER.addAndGet(-capacity);
+            assert usedMemory >= 0;
+        }
+    }
+
+    public static boolean useDirectBufferNoCleaner() {
+        return USE_DIRECT_BUFFER_NO_CLEANER;
+    }
+
     /**
      * Compare two {@code byte} arrays for equality. For performance reasons no bounds checking on the
      * parameters is performed.
@@ -508,10 +634,36 @@ public final class PlatformDependent {
      * by the caller.
      */
     public static boolean equals(byte[] bytes1, int startPos1, byte[] bytes2, int startPos2, int length) {
-        if (!hasUnsafe() || !PlatformDependent0.unalignedAccess()) {
-            return equalsSafe(bytes1, startPos1, bytes2, startPos2, length);
-        }
-        return PlatformDependent0.equals(bytes1, startPos1, bytes2, startPos2, length);
+        return !hasUnsafe() || !unalignedAccess() ?
+                  equalsSafe(bytes1, startPos1, bytes2, startPos2, length) :
+                  PlatformDependent0.equals(bytes1, startPos1, bytes2, startPos2, length);
+    }
+
+    /**
+     * Compare two {@code byte} arrays for equality without leaking timing information.
+     * For performance reasons no bounds checking on the parameters is performed.
+     * <p>
+     * The {@code int} return type is intentional and is designed to allow cascading of constant time operations:
+     * <pre>
+     *     byte[] s1 = new {1, 2, 3};
+     *     byte[] s2 = new {1, 2, 3};
+     *     byte[] s3 = new {1, 2, 3};
+     *     byte[] s4 = new {4, 5, 6};
+     *     boolean equals = (equalsConstantTime(s1, 0, s2, 0, s1.length) &
+     *                       equalsConstantTime(s3, 0, s4, 0, s3.length)) != 0;
+     * </pre>
+     * @param bytes1 the first byte array.
+     * @param startPos1 the position (inclusive) to start comparing in {@code bytes1}.
+     * @param bytes2 the second byte array.
+     * @param startPos2 the position (inclusive) to start comparing in {@code bytes2}.
+     * @param length the amount of bytes to compare. This is assumed to be validated as not going out of bounds
+     * by the caller.
+     * @return {@code 0} if not equal. {@code 1} if equal.
+     */
+    public static int equalsConstantTime(byte[] bytes1, int startPos1, byte[] bytes2, int startPos2, int length) {
+        return !hasUnsafe() || !unalignedAccess() ?
+                  ConstantTimeUtils.equalsConstantTime(bytes1, startPos1, bytes2, startPos2, length) :
+                  PlatformDependent0.equalsConstantTime(bytes1, startPos1, bytes2, startPos2, length);
     }
 
     /**
@@ -524,7 +676,7 @@ public final class PlatformDependent {
      * The resulting hash code will be case insensitive.
      */
     public static int hashCodeAscii(byte[] bytes, int startPos, int length) {
-        if (!hasUnsafe() || !PlatformDependent0.unalignedAccess()) {
+        if (!hasUnsafe() || !unalignedAccess()) {
             return hashCodeAsciiSafe(bytes, startPos, length);
         }
         return PlatformDependent0.hashCodeAscii(bytes, startPos, length);
@@ -541,7 +693,7 @@ public final class PlatformDependent {
      * The resulting hash code will be case insensitive.
      */
     public static int hashCodeAscii(CharSequence bytes) {
-        if (!hasUnsafe() || !PlatformDependent0.unalignedAccess()) {
+        if (!hasUnsafe() || !unalignedAccess()) {
             return hashCodeAsciiSafe(bytes);
         } else if (PlatformDependent0.hasCharArray(bytes)) {
             return PlatformDependent0.hashCodeAscii(PlatformDependent0.charArray(bytes));
@@ -607,7 +759,21 @@ public final class PlatformDependent {
      * consumer (one thread!).
      */
     public static <T> Queue<T> newMpscQueue() {
-        return new MpscLinkedQueue<T>();
+        return newMpscQueue(DEFAULT_MAX_MPSC_CAPACITY);
+    }
+
+    /**
+     * Create a new {@link Queue} which is safe to use for multiple producers (different threads) and a single
+     * consumer (one thread!).
+     */
+    public static <T> Queue<T> newMpscQueue(int maxCapacity) {
+        return hasUnsafe() ?
+                new MpscChunkedArrayQueue<T>(MPSC_CHUNK_SIZE,
+                        // Calculate the max capacity which can not be bigger then MAX_ALLOWED_MPSC_CAPACITY.
+                        // This is forced by the MpscChunkedArrayQueue implementation as will try to round it
+                        // up to the next power of two and so will overflow otherwise.
+                        Math.max(Math.min(maxCapacity, MAX_ALLOWED_MPSC_CAPACITY), MIN_MAX_MPSC_CAPACITY), true)
+                : new MpscLinkedAtomicQueue<T>();
     }
 
     /**
@@ -615,10 +781,7 @@ public final class PlatformDependent {
      * consumer (one thread!).
      */
     public static <T> Queue<T> newSpscQueue() {
-        if (hasUnsafe()) {
-            return new SpscLinkedQueue<T>();
-        }
-        return new SpscLinkedAtomicQueue<T>();
+        return hasUnsafe() ? new SpscLinkedQueue<T>() : new SpscLinkedAtomicQueue<T>();
     }
 
     /**
@@ -626,11 +789,7 @@ public final class PlatformDependent {
      * consumer (one thread!) with the given fixes {@code capacity}.
      */
     public static <T> Queue<T> newFixedMpscQueue(int capacity) {
-        if (hasUnsafe()) {
-            return new MpscArrayQueue<T>(capacity);
-        } else {
-            return new LinkedBlockingQueue<T>(capacity);
-        }
+        return hasUnsafe() ? new MpscArrayQueue<T>(capacity) : new MpscAtomicArrayQueue<T>(capacity);
     }
 
     /**

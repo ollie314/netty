@@ -21,15 +21,14 @@ import io.netty.channel.ChannelConfig;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandler;
-import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelId;
-import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelMetadata;
 import io.netty.channel.ChannelOutboundBuffer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.DefaultChannelConfig;
+import io.netty.channel.DefaultChannelPipeline;
 import io.netty.channel.EventLoop;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.internal.ObjectUtil;
@@ -133,11 +132,35 @@ public class EmbeddedChannel extends AbstractChannel {
      */
     public EmbeddedChannel(ChannelId channelId, boolean hasDisconnect, final ChannelHandler... handlers) {
         super(null, channelId);
-
-        ObjectUtil.checkNotNull(handlers, "handlers");
-        metadata = hasDisconnect ? METADATA_DISCONNECT : METADATA_NO_DISCONNECT;
+        metadata = metadata(hasDisconnect);
         config = new DefaultChannelConfig(this);
+        setup(handlers);
+    }
 
+    /**
+     * Create a new instance with the channel ID set to the given ID and the pipeline
+     * initialized with the specified handlers.
+     *
+     * @param channelId the {@link ChannelId} that will be used to identify this channel
+     * @param hasDisconnect {@code false} if this {@link Channel} will delegate {@link #disconnect()}
+     *                      to {@link #close()}, {@link false} otherwise.
+     * @param config the {@link ChannelConfig} which will be returned by {@link #config()}.
+     * @param handlers the {@link ChannelHandler}s which will be add in the {@link ChannelPipeline}
+     */
+    public EmbeddedChannel(ChannelId channelId, boolean hasDisconnect, final ChannelConfig config,
+                           final ChannelHandler... handlers) {
+        super(null, channelId);
+        metadata = metadata(hasDisconnect);
+        this.config = ObjectUtil.checkNotNull(config, "config");
+        setup(handlers);
+    }
+
+    private static ChannelMetadata metadata(boolean hasDisconnect) {
+        return hasDisconnect ? METADATA_DISCONNECT : METADATA_NO_DISCONNECT;
+    }
+
+    private void setup(final ChannelHandler... handlers) {
+        ObjectUtil.checkNotNull(handlers, "handlers");
         ChannelPipeline p = pipeline();
         p.addLast(new ChannelInitializer<Channel>() {
             @Override
@@ -154,7 +177,11 @@ public class EmbeddedChannel extends AbstractChannel {
 
         ChannelFuture future = loop.register(this);
         assert future.isDone();
-        p.addLast(new LastInboundHandler());
+    }
+
+    @Override
+    protected final DefaultChannelPipeline newChannelPipeline() {
+        return new EmbeddedChannelPipeline(this);
     }
 
     @Override
@@ -548,15 +575,19 @@ public class EmbeddedChannel extends AbstractChannel {
         }
     }
 
-    private final class LastInboundHandler extends ChannelInboundHandlerAdapter {
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-            inboundMessages().add(msg);
+    private final class EmbeddedChannelPipeline extends DefaultChannelPipeline {
+        public EmbeddedChannelPipeline(EmbeddedChannel channel) {
+            super(channel);
         }
 
         @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        protected void onUnhandledInboundException(Throwable cause) {
             recordException(cause);
+        }
+
+        @Override
+        protected void onUnhandledInboundMessage(Object msg) {
+            inboundMessages().add(msg);
         }
     }
 }

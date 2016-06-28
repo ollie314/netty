@@ -25,6 +25,7 @@ import io.netty.channel.DefaultChannelPromise;
 import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.util.AsciiString;
 import io.netty.util.concurrent.EventExecutor;
+import io.netty.util.internal.UnstableApi;
 
 import static io.netty.buffer.Unpooled.directBuffer;
 import static io.netty.buffer.Unpooled.unreleasableBuffer;
@@ -35,6 +36,7 @@ import static java.lang.Math.min;
 /**
  * Constants and utility method used for encoding/decoding HTTP2 frames.
  */
+@UnstableApi
 public final class Http2CodecUtil {
     public static final int CONNECTION_STREAM_ID = 0;
     public static final int HTTP_UPGRADE_STREAM_ID = 1;
@@ -44,6 +46,11 @@ public final class Http2CodecUtil {
 
     public static final int PING_FRAME_PAYLOAD_LENGTH = 8;
     public static final short MAX_UNSIGNED_BYTE = 0xFF;
+    /**
+     * The maximum number of padding bytes. That is the 255 padding bytes appended to the end of a frame and the 1 byte
+     * pad length field.
+     */
+    public static final int MAX_PADDING = 256;
     public static final int MAX_UNSIGNED_SHORT = 0xFFFF;
     public static final long MAX_UNSIGNED_INT = 0xFFFFFFFFL;
     public static final int FRAME_HEADER_LENGTH = 9;
@@ -117,7 +124,7 @@ public final class Http2CodecUtil {
      */
     public static ByteBuf connectionPrefaceBuf() {
         // Return a duplicate so that modifications to the reader index will not affect the original buffer.
-        return CONNECTION_PREFACE.duplicate().retain();
+        return CONNECTION_PREFACE.retainedDuplicate();
     }
 
     /**
@@ -125,7 +132,7 @@ public final class Http2CodecUtil {
      */
     public static ByteBuf emptyPingBuf() {
         // Return a duplicate so that modifications to the reader index will not affect the original buffer.
-        return EMPTY_PING.duplicate().retain();
+        return EMPTY_PING.retainedDuplicate();
     }
 
     /**
@@ -338,5 +345,11 @@ public final class Http2CodecUtil {
         }
     }
 
+    public static void verifyPadding(int padding) {
+        if (padding < 0 || padding > MAX_PADDING) {
+            throw new IllegalArgumentException(String.format("Invalid padding '%d'. Padding must be between 0 and " +
+                                                             "%d (inclusive).", padding, MAX_PADDING));
+        }
+    }
     private Http2CodecUtil() { }
 }

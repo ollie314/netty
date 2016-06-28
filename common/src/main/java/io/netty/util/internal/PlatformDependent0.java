@@ -19,6 +19,7 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import sun.misc.Unsafe;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.Buffer;
@@ -44,6 +45,8 @@ final class PlatformDependent0 {
     private static final long CHAR_ARRAY_INDEX_SCALE;
     private static final long STRING_CHAR_VALUE_FIELD_OFFSET;
     private static final long STRING_BYTE_VALUE_FIELD_OFFSET;
+    private static final Constructor<?> DIRECT_BUFFER_CONSTRUCTOR;
+
     static final int HASH_CODE_ASCII_SEED = 0xc2b2ae35; // constant borrowed from murmur3
 
     /**
@@ -73,6 +76,7 @@ final class PlatformDependent0 {
             // Failed to access the address field.
             addressField = null;
         }
+
         logger.debug("java.nio.Buffer.address: {}", addressField != null? "available" : "unavailable");
 
         Unsafe unsafe;
@@ -116,7 +120,26 @@ final class PlatformDependent0 {
             BYTE_ARRAY_BASE_OFFSET = CHAR_ARRAY_BASE_OFFSET = CHAR_ARRAY_INDEX_SCALE = -1;
             UNALIGNED = false;
             STRING_CHAR_VALUE_FIELD_OFFSET = STRING_BYTE_VALUE_FIELD_OFFSET = -1;
+            DIRECT_BUFFER_CONSTRUCTOR = null;
         } else {
+            Constructor<?> directBufferConstructor;
+            long address = -1;
+            try {
+                directBufferConstructor = direct.getClass().getDeclaredConstructor(long.class, int.class);
+                directBufferConstructor.setAccessible(true);
+                address = UNSAFE.allocateMemory(1);
+
+                // Try to use the constructor now
+                directBufferConstructor.newInstance(address, 1);
+            } catch (Throwable t) {
+                directBufferConstructor = null;
+            } finally {
+                if (address != -1) {
+                    UNSAFE.freeMemory(address);
+                }
+            }
+            DIRECT_BUFFER_CONSTRUCTOR = directBufferConstructor;
+
             ADDRESS_FIELD_OFFSET = objectFieldOffset(addressField);
             BYTE_ARRAY_BASE_OFFSET = UNSAFE.arrayBaseOffset(byte[].class);
             CHAR_ARRAY_BASE_OFFSET = UNSAFE.arrayBaseOffset(char[].class);
@@ -179,6 +202,9 @@ final class PlatformDependent0 {
                 }
             }
         }
+
+        logger.debug("java.nio.DirectByteBuffer.<init>(long, int): {}",
+                DIRECT_BUFFER_CONSTRUCTOR != null? "available" : "unavailable");
     }
 
     static boolean isUnaligned() {
@@ -196,6 +222,30 @@ final class PlatformDependent0 {
     static void throwException(Throwable cause) {
         // JVM has been observed to crash when passing a null argument. See https://github.com/netty/netty/issues/4131.
         UNSAFE.throwException(checkNotNull(cause, "cause"));
+    }
+
+    static boolean hasDirectBufferNoCleanerConstructor() {
+        return DIRECT_BUFFER_CONSTRUCTOR != null;
+    }
+
+    static ByteBuffer reallocateDirectNoCleaner(ByteBuffer buffer, int capacity) {
+        return newDirectBuffer(UNSAFE.reallocateMemory(directBufferAddress(buffer), capacity), capacity);
+    }
+
+    static ByteBuffer allocateDirectNoCleaner(int capacity) {
+        return newDirectBuffer(UNSAFE.allocateMemory(capacity), capacity);
+    }
+
+    private static ByteBuffer newDirectBuffer(long address, int capacity) {
+        try {
+            return (ByteBuffer) DIRECT_BUFFER_CONSTRUCTOR.newInstance(address, capacity);
+        } catch (Throwable cause) {
+            // Not expected to ever throw!
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            throw new Error(cause);
+        }
     }
 
     static void freeDirectBuffer(ByteBuffer buffer) {
@@ -322,10 +372,15 @@ final class PlatformDependent0 {
         }
     }
 
+    static void setMemory(long address, long bytes, byte value) {
+        UNSAFE.setMemory(address, bytes, value);
+    }
+
+    static void setMemory(Object o, long offset, long bytes, byte value) {
+        UNSAFE.setMemory(o, offset, bytes, value);
+    }
+
     static boolean equals(byte[] bytes1, int startPos1, byte[] bytes2, int startPos2, int length) {
-        if (length == 0) {
-            return true;
-        }
         final long baseOffset1 = BYTE_ARRAY_BASE_OFFSET + startPos1;
         final long baseOffset2 = BYTE_ARRAY_BASE_OFFSET + startPos2;
         final int remainingBytes = length & 7;
@@ -357,6 +412,47 @@ final class PlatformDependent0 {
             return UNSAFE.getByte(bytes1, baseOffset1) == UNSAFE.getByte(bytes2, baseOffset2);
         default:
             return true;
+        }
+    }
+
+    static int equalsConstantTime(byte[] bytes1, int startPos1, byte[] bytes2, int startPos2, int length) {
+        long result = 0;
+        final long baseOffset1 = BYTE_ARRAY_BASE_OFFSET + startPos1;
+        final long baseOffset2 = BYTE_ARRAY_BASE_OFFSET + startPos2;
+        final int remainingBytes = length & 7;
+        final long end = baseOffset1 + remainingBytes;
+        for (long i = baseOffset1 - 8 + length, j = baseOffset2 - 8 + length; i >= end; i -= 8, j -= 8) {
+            result |= UNSAFE.getLong(bytes1, i) ^ UNSAFE.getLong(bytes2, j);
+        }
+        switch (remainingBytes) {
+            case 7:
+                return ConstantTimeUtils.equalsConstantTime(result |
+                        (UNSAFE.getInt(bytes1, baseOffset1 + 3) ^ UNSAFE.getInt(bytes2, baseOffset2 + 3)) |
+                        (UNSAFE.getChar(bytes1, baseOffset1 + 1) ^ UNSAFE.getChar(bytes2, baseOffset2 + 1)) |
+                        (UNSAFE.getByte(bytes1, baseOffset1) ^ UNSAFE.getByte(bytes2, baseOffset2)), 0);
+            case 6:
+                return ConstantTimeUtils.equalsConstantTime(result |
+                        (UNSAFE.getInt(bytes1, baseOffset1 + 2) ^ UNSAFE.getInt(bytes2, baseOffset2 + 2)) |
+                        (UNSAFE.getChar(bytes1, baseOffset1) ^ UNSAFE.getChar(bytes2, baseOffset2)), 0);
+            case 5:
+                return ConstantTimeUtils.equalsConstantTime(result |
+                        (UNSAFE.getInt(bytes1, baseOffset1 + 1) ^ UNSAFE.getInt(bytes2, baseOffset2 + 1)) |
+                        (UNSAFE.getByte(bytes1, baseOffset1) ^ UNSAFE.getByte(bytes2, baseOffset2)), 0);
+            case 4:
+                return ConstantTimeUtils.equalsConstantTime(result |
+                        (UNSAFE.getInt(bytes1, baseOffset1) ^ UNSAFE.getInt(bytes2, baseOffset2)), 0);
+            case 3:
+                return ConstantTimeUtils.equalsConstantTime(result |
+                        (UNSAFE.getChar(bytes1, baseOffset1 + 1) ^ UNSAFE.getChar(bytes2, baseOffset2 + 1)) |
+                        (UNSAFE.getByte(bytes1, baseOffset1) ^ UNSAFE.getByte(bytes2, baseOffset2)), 0);
+            case 2:
+                return ConstantTimeUtils.equalsConstantTime(result |
+                        (UNSAFE.getChar(bytes1, baseOffset1) ^ UNSAFE.getChar(bytes2, baseOffset2)), 0);
+            case 1:
+                return ConstantTimeUtils.equalsConstantTime(result |
+                        (UNSAFE.getByte(bytes1, baseOffset1) ^ UNSAFE.getByte(bytes2, baseOffset2)), 0);
+            default:
+                return ConstantTimeUtils.equalsConstantTime(result, 0);
         }
     }
 

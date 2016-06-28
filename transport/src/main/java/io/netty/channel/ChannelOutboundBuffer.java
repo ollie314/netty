@@ -24,14 +24,11 @@ import io.netty.util.Recycler.Handle;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.internal.InternalThreadLocalMap;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.ThrowableUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.PrintStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.util.Arrays;
@@ -633,7 +630,7 @@ public final class ChannelOutboundBuffer {
 
     void close(final ClosedChannelException cause) {
         if (inFail) {
-            channel.eventLoop().execute(new OneTimeTask() {
+            channel.eventLoop().execute(new Runnable() {
                 @Override
                 public void run() {
                     close(cause);
@@ -680,7 +677,7 @@ public final class ChannelOutboundBuffer {
             } else {
                 logger.warn(
                         "Failed to mark a promise as success because it has failed already: {}, unnotified cause {}",
-                        promise, stackTraceToString(err));
+                        promise, ThrowableUtil.stackTraceToString(err));
             }
         }
     }
@@ -692,24 +689,8 @@ public final class ChannelOutboundBuffer {
                 logger.warn("Failed to mark a promise as failure because it has succeeded already: {}", promise, cause);
             } else {
                 logger.warn(
-                        "Failed to mark a promise as failure because it hass failed already: {}, unnotified cause {}",
-                        promise, stackTraceToString(err), cause);
-            }
-        }
-    }
-
-    private static String stackTraceToString(Throwable cause) {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        PrintStream pout = new PrintStream(out);
-        cause.printStackTrace(pout);
-        pout.flush();
-        try {
-            return new String(out.toByteArray());
-        } finally {
-            try {
-                out.close();
-            } catch (IOException ignore) {
-                // ignore as should never happen
+                        "Failed to mark a promise as failure because it has failed already: {}, unnotified cause {}",
+                        promise, ThrowableUtil.stackTraceToString(err), cause);
             }
         }
     }
@@ -798,7 +779,7 @@ public final class ChannelOutboundBuffer {
             }
         };
 
-        private final Handle handle;
+        private final Handle<Entry> handle;
         Entry next;
         Object msg;
         ByteBuffer[] bufs;
@@ -810,7 +791,7 @@ public final class ChannelOutboundBuffer {
         int count = -1;
         boolean cancelled;
 
-        private Entry(Handle handle) {
+        private Entry(Handle<Entry> handle) {
             this.handle = handle;
         }
 
@@ -853,7 +834,7 @@ public final class ChannelOutboundBuffer {
             pendingSize = 0;
             count = -1;
             cancelled = false;
-            RECYCLER.recycle(this, handle);
+            handle.recycle(this);
         }
 
         Entry recycleAndGetNext() {

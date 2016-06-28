@@ -20,6 +20,7 @@ import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageEncoder;
+import io.netty.util.internal.UnstableApi;
 
 import java.util.Iterator;
 import java.util.List;
@@ -28,6 +29,7 @@ import java.util.RandomAccess;
 /**
  * Encoder for SMTP requests.
  */
+@UnstableApi
 public final class SmtpRequestEncoder extends MessageToMessageEncoder<Object> {
     private static final byte[] CRLF = {'\r', '\n'};
     private static final byte[] DOT_CRLF = {'.', '\r', '\n'};
@@ -74,7 +76,7 @@ public final class SmtpRequestEncoder extends MessageToMessageEncoder<Object> {
             final ByteBuf content = ((SmtpContent) msg).content();
             out.add(content.retain());
             if (msg instanceof LastSmtpContent) {
-                out.add(DOT_CRLF_BUFFER.duplicate().retain());
+                out.add(DOT_CRLF_BUFFER.retainedDuplicate());
                 contentExpected = false;
             }
         }

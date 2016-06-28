@@ -17,10 +17,8 @@ package io.netty.handler.ssl;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.Unpooled;
-import io.netty.handler.codec.base64.Base64;
-import io.netty.util.CharsetUtil;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -29,17 +27,19 @@ import org.apache.tomcat.jni.Pool;
 import org.apache.tomcat.jni.SSL;
 import org.apache.tomcat.jni.SSLContext;
 
-import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509ExtendedTrustManager;
+import javax.net.ssl.X509KeyManager;
 import javax.net.ssl.X509TrustManager;
-import java.io.File;
+import java.security.AccessController;
 import java.security.PrivateKey;
+import java.security.PrivilegedAction;
 import java.security.cert.Certificate;
-import java.security.cert.CertificateException;
 import java.security.cert.CertificateExpiredException;
 import java.security.cert.CertificateNotYetValidException;
 import java.security.cert.CertificateRevokedException;
@@ -55,41 +55,40 @@ import static io.netty.handler.ssl.ApplicationProtocolConfig.SelectorFailureBeha
 import static io.netty.handler.ssl.ApplicationProtocolConfig.SelectedListenerFailureBehavior;
 
 public abstract class OpenSslContext extends SslContext {
-    private static final byte[] BEGIN_CERT = "-----BEGIN CERTIFICATE-----\n".getBytes(CharsetUtil.US_ASCII);
-    private static final byte[] END_CERT = "\n-----END CERTIFICATE-----\n".getBytes(CharsetUtil.US_ASCII);
-    private static final byte[] BEGIN_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\n".getBytes(CharsetUtil.US_ASCII);
-    private static final byte[] END_PRIVATE_KEY = "\n-----END PRIVATE KEY-----\n".getBytes(CharsetUtil.US_ASCII);
-
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(OpenSslContext.class);
     /**
      * To make it easier for users to replace JDK implemention with OpenSsl version we also use
      * {@code jdk.tls.rejectClientInitiatedRenegotiation} to allow disabling client initiated renegotiation.
      * Java8+ uses this system property as well.
-     *
+     * <p>
      * See also <a href="http://blog.ivanristic.com/2014/03/ssl-tls-improvements-in-java-8.html">
      * Significant SSL/TLS improvements in Java 8</a>
      */
     private static final boolean JDK_REJECT_CLIENT_INITIATED_RENEGOTIATION =
             SystemPropertyUtil.getBoolean("jdk.tls.rejectClientInitiatedRenegotiation", false);
     private static final List<String> DEFAULT_CIPHERS;
+    private static final Integer DH_KEY_LENGTH;
 
     // TODO: Maybe make configurable ?
     protected static final int VERIFY_DEPTH = 10;
 
-    /** The OpenSSL SSL_CTX object */
+    /**
+     * The OpenSSL SSL_CTX object
+     */
     protected volatile long ctx;
     long aprPool;
     @SuppressWarnings({ "unused", "FieldMayBeFinal" })
     private volatile int aprPoolDestroyed;
-    private volatile boolean rejectRemoteInitiatedRenegotiation;
     private final List<String> unmodifiableCiphers;
     private final long sessionCacheSize;
     private final long sessionTimeout;
-    private final OpenSslEngineMap engineMap = new DefaultOpenSslEngineMap();
     private final OpenSslApplicationProtocolNegotiator apn;
     private final int mode;
-    private final Certificate[] keyCertChain;
-    private final ClientAuth clientAuth;
+
+    final Certificate[] keyCertChain;
+    final ClientAuth clientAuth;
+    final OpenSslEngineMap engineMap = new DefaultOpenSslEngineMap();
+    volatile boolean rejectRemoteInitiatedRenegotiation;
 
     static final OpenSslApplicationProtocolNegotiator NONE_PROTOCOL_NEGOTIATOR =
             new OpenSslApplicationProtocolNegotiator() {
@@ -131,6 +130,28 @@ public abstract class OpenSslContext extends SslContext {
         if (logger.isDebugEnabled()) {
             logger.debug("Default cipher suite (OpenSSL): " + ciphers);
         }
+
+        Integer dhLen = null;
+
+        try {
+            String dhKeySize = AccessController.doPrivileged(new PrivilegedAction<String>() {
+                @Override
+                public String run() {
+                    return SystemPropertyUtil.get("jdk.tls.ephemeralDHKeySize");
+                }
+            });
+            if (dhKeySize != null) {
+                try {
+                    dhLen = Integer.parseInt(dhKeySize);
+                } catch (NumberFormatException e) {
+                    logger.debug("OpenSslContext only support -Djdk.tls.ephemeralDHKeySize={int}, but got: "
+                            + dhKeySize);
+                }
+            }
+        } catch (Throwable ignore) {
+            // ignore
+        }
+        DH_KEY_LENGTH = dhLen;
     }
 
     OpenSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter, ApplicationProtocolConfig apnCfg,
@@ -163,7 +184,7 @@ public abstract class OpenSslContext extends SslContext {
             convertedCiphers = null;
         } else {
             convertedCiphers = new ArrayList<String>();
-            for (String c: ciphers) {
+            for (String c : ciphers) {
                 if (c == null) {
                     break;
                 }
@@ -201,11 +222,20 @@ public abstract class OpenSslContext extends SslContext {
                 SSLContext.setOptions(ctx, SSL.SSL_OP_SINGLE_ECDH_USE);
                 SSLContext.setOptions(ctx, SSL.SSL_OP_SINGLE_DH_USE);
                 SSLContext.setOptions(ctx, SSL.SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+                // Disable ticket support by default to be more inline with SSLEngineImpl of the JDK.
+                // This also let SSLSession.getId() work the same way for the JDK implementation and the OpenSSLEngine.
+                // If tickets are supported SSLSession.getId() will only return an ID on the server-side if it could
+                // make use of tickets.
+                SSLContext.setOptions(ctx, SSL.SSL_OP_NO_TICKET);
 
                 // We need to enable SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER as the memory address may change between
                 // calling OpenSSLEngine.wrap(...).
                 // See https://github.com/netty/netty-tcnative/issues/100
                 SSLContext.setMode(ctx, SSLContext.getMode(ctx) | SSL.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
+                if (DH_KEY_LENGTH != null) {
+                    SSLContext.setTmpDHLength(ctx, DH_KEY_LENGTH);
+                }
 
                 /* List the ciphers that are permitted to negotiate. */
                 try {
@@ -223,18 +253,18 @@ public abstract class OpenSslContext extends SslContext {
                     int selectorBehavior = opensslSelectorFailureBehavior(apn.selectorFailureBehavior());
 
                     switch (apn.protocol()) {
-                    case NPN:
-                        SSLContext.setNpnProtos(ctx, protocols, selectorBehavior);
-                        break;
-                    case ALPN:
-                        SSLContext.setAlpnProtos(ctx, protocols, selectorBehavior);
-                        break;
-                    case NPN_AND_ALPN:
-                        SSLContext.setNpnProtos(ctx, protocols, selectorBehavior);
-                        SSLContext.setAlpnProtos(ctx, protocols, selectorBehavior);
-                        break;
-                    default:
-                        throw new Error();
+                        case NPN:
+                            SSLContext.setNpnProtos(ctx, protocols, selectorBehavior);
+                            break;
+                        case ALPN:
+                            SSLContext.setAlpnProtos(ctx, protocols, selectorBehavior);
+                            break;
+                        case NPN_AND_ALPN:
+                            SSLContext.setNpnProtos(ctx, protocols, selectorBehavior);
+                            SSLContext.setAlpnProtos(ctx, protocols, selectorBehavior);
+                            break;
+                        default:
+                            throw new Error();
                     }
                 }
 
@@ -270,12 +300,12 @@ public abstract class OpenSslContext extends SslContext {
 
     private static int opensslSelectorFailureBehavior(SelectorFailureBehavior behavior) {
         switch (behavior) {
-        case NO_ADVERTISE:
-            return SSL.SSL_SELECTOR_FAILURE_NO_ADVERTISE;
-        case CHOOSE_MY_LAST_PROTOCOL:
-            return SSL.SSL_SELECTOR_FAILURE_CHOOSE_MY_LAST_PROTOCOL;
-        default:
-            throw new Error();
+            case NO_ADVERTISE:
+                return SSL.SSL_SELECTOR_FAILURE_NO_ADVERTISE;
+            case CHOOSE_MY_LAST_PROTOCOL:
+                return SSL.SSL_SELECTOR_FAILURE_CHOOSE_MY_LAST_PROTOCOL;
+            default:
+                throw new Error();
         }
     }
 
@@ -306,9 +336,10 @@ public abstract class OpenSslContext extends SslContext {
 
     @Override
     public final SSLEngine newEngine(ByteBufAllocator alloc, String peerHost, int peerPort) {
-        return new OpenSslEngine(ctx, alloc, isClient(), sessionContext(), apn, engineMap,
-                rejectRemoteInitiatedRenegotiation, peerHost, peerPort, keyCertChain, clientAuth);
+        return new OpenSslEngine(this, alloc, peerHost, peerPort);
     }
+
+    abstract OpenSslKeyMaterialManager keyMaterialManager();
 
     /**
      * Returns a new server-side {@link SSLEngine} with the current configuration.
@@ -332,6 +363,7 @@ public abstract class OpenSslContext extends SslContext {
 
     /**
      * Returns the stats of this context.
+     *
      * @deprecated use {@link #sessionContext#stats()}
      */
     @Deprecated
@@ -356,6 +388,7 @@ public abstract class OpenSslContext extends SslContext {
 
     /**
      * Sets the SSL session ticket keys of this context.
+     *
      * @deprecated use {@link OpenSslSessionContext#setTicketKeys(byte[])}
      */
     @Deprecated
@@ -375,7 +408,10 @@ public abstract class OpenSslContext extends SslContext {
         return ctx;
     }
 
-    protected final void destroy() {
+    // IMPORTANT: This method must only be called from either the constructor or the finalizer as a user MUST never
+    //            get access to an OpenSslSessionContext after this method was called to prevent the user from
+    //            producing a segfault.
+    final void destroy() {
         synchronized (OpenSslContext.class) {
             if (ctx != 0) {
                 SSLContext.free(ctx);
@@ -407,9 +443,19 @@ public abstract class OpenSslContext extends SslContext {
         throw new IllegalStateException("no X509TrustManager found");
     }
 
+    protected static X509KeyManager chooseX509KeyManager(KeyManager[] kms) {
+        for (KeyManager km : kms) {
+            if (km instanceof X509KeyManager) {
+                return (X509KeyManager) km;
+            }
+        }
+        throw new IllegalStateException("no X509KeyManager found");
+    }
+
     /**
      * Translate a {@link ApplicationProtocolConfig} object to a
      * {@link OpenSslApplicationProtocolNegotiator} object.
+     *
      * @param config The configuration which defines the translation
      * @return The results of the translation
      */
@@ -419,45 +465,55 @@ public abstract class OpenSslContext extends SslContext {
         }
 
         switch (config.protocol()) {
-        case NONE:
-            return NONE_PROTOCOL_NEGOTIATOR;
-        case ALPN:
-        case NPN:
-        case NPN_AND_ALPN:
-            switch (config.selectedListenerFailureBehavior()) {
-            case CHOOSE_MY_LAST_PROTOCOL:
-            case ACCEPT:
-                switch (config.selectorFailureBehavior()) {
-                case CHOOSE_MY_LAST_PROTOCOL:
-                case NO_ADVERTISE:
-                    return new OpenSslDefaultApplicationProtocolNegotiator(
-                            config);
-                default:
-                    throw new UnsupportedOperationException(
-                            new StringBuilder("OpenSSL provider does not support ")
-                                    .append(config.selectorFailureBehavior())
-                                    .append(" behavior").toString());
+            case NONE:
+                return NONE_PROTOCOL_NEGOTIATOR;
+            case ALPN:
+            case NPN:
+            case NPN_AND_ALPN:
+                switch (config.selectedListenerFailureBehavior()) {
+                    case CHOOSE_MY_LAST_PROTOCOL:
+                    case ACCEPT:
+                        switch (config.selectorFailureBehavior()) {
+                            case CHOOSE_MY_LAST_PROTOCOL:
+                            case NO_ADVERTISE:
+                                return new OpenSslDefaultApplicationProtocolNegotiator(
+                                        config);
+                            default:
+                                throw new UnsupportedOperationException(
+                                        new StringBuilder("OpenSSL provider does not support ")
+                                                .append(config.selectorFailureBehavior())
+                                                .append(" behavior").toString());
+                        }
+                    default:
+                        throw new UnsupportedOperationException(
+                                new StringBuilder("OpenSSL provider does not support ")
+                                        .append(config.selectedListenerFailureBehavior())
+                                        .append(" behavior").toString());
                 }
             default:
-                throw new UnsupportedOperationException(
-                        new StringBuilder("OpenSSL provider does not support ")
-                                .append(config.selectedListenerFailureBehavior())
-                                .append(" behavior").toString());
-            }
-        default:
-            throw new Error();
+                throw new Error();
         }
     }
 
     static boolean useExtendedTrustManager(X509TrustManager trustManager) {
-         return PlatformDependent.javaVersion() >= 7 && trustManager instanceof X509ExtendedTrustManager;
+        return PlatformDependent.javaVersion() >= 7 && trustManager instanceof X509ExtendedTrustManager;
     }
 
-    abstract class AbstractCertificateVerifier implements CertificateVerifier {
+    static boolean useExtendedKeyManager(X509KeyManager keyManager) {
+        return PlatformDependent.javaVersion() >= 7 && keyManager instanceof X509ExtendedKeyManager;
+    }
+
+    abstract static class AbstractCertificateVerifier implements CertificateVerifier {
+        private final OpenSslEngineMap engineMap;
+
+        AbstractCertificateVerifier(OpenSslEngineMap engineMap) {
+            this.engineMap = engineMap;
+        }
+
         @Override
         public final int verify(long ssl, byte[][] chain, String auth) {
             X509Certificate[] peerCerts = certificates(chain);
-            final OpenSslEngine engine = engineMap.remove(ssl);
+            final OpenSslEngine engine = engineMap.get(ssl);
             try {
                 verify(engine, peerCerts, auth);
                 return CertificateVerifier.X509_V_OK;
@@ -488,6 +544,7 @@ public abstract class OpenSslContext extends SslContext {
 
     private static final class DefaultOpenSslEngineMap implements OpenSslEngineMap {
         private final Map<Long, OpenSslEngine> engines = PlatformDependent.newConcurrentHashMap();
+
         @Override
         public OpenSslEngine remove(long ssl) {
             return engines.remove(ssl);
@@ -497,8 +554,41 @@ public abstract class OpenSslContext extends SslContext {
         public void add(OpenSslEngine engine) {
             engines.put(engine.sslPointer(), engine);
         }
+
+        @Override
+        public OpenSslEngine get(long ssl) {
+            return engines.get(ssl);
+        }
     }
 
+    static void setKeyMaterial(long ctx, X509Certificate[] keyCertChain, PrivateKey key, String keyPassword)
+            throws SSLException {
+         /* Load the certificate file and private key. */
+        long keyBio = 0;
+        long keyCertChainBio = 0;
+
+        try {
+            keyCertChainBio = toBIO(keyCertChain);
+            keyBio = toBIO(key);
+
+            SSLContext.setCertificateBio(
+                    ctx, keyCertChainBio, keyBio,
+                    keyPassword == null ? StringUtil.EMPTY_STRING : keyPassword, SSL.SSL_AIDX_RSA);
+            // We may have more then one cert in the chain so add all of them now.
+            SSLContext.setCertificateChainBio(ctx, keyCertChainBio, false);
+        } catch (SSLException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new SSLException("failed to set certificate and key", e);
+        } finally {
+            if (keyBio != 0) {
+                SSL.freeBIO(keyBio);
+            }
+            if (keyCertChainBio != 0) {
+                SSL.freeBIO(keyCertChainBio);
+            }
+        }
+    }
     /**
      * Return the pointer to a <a href="https://www.openssl.org/docs/crypto/BIO_get_mem_ptr.html">in-memory BIO</a>
      * or {@code 0} if the {@code key} is {@code null}. The BIO contains the content of the {@code key}.
@@ -507,25 +597,13 @@ public abstract class OpenSslContext extends SslContext {
         if (key == null) {
             return 0;
         }
-        ByteBuf buffer = Unpooled.directBuffer();
+
+        ByteBufAllocator allocator = ByteBufAllocator.DEFAULT;
+        PemEncoded pem = PemPrivateKey.toPEM(allocator, true, key);
         try {
-            buffer.writeBytes(BEGIN_PRIVATE_KEY);
-            ByteBuf wrappedBuf = Unpooled.wrappedBuffer(key.getEncoded());
-            final ByteBuf encodedBuf;
-            try {
-                encodedBuf = Base64.encode(wrappedBuf, true);
-                try {
-                    buffer.writeBytes(encodedBuf);
-                } finally {
-                    encodedBuf.release();
-                }
-            } finally {
-                wrappedBuf.release();
-            }
-            buffer.writeBytes(END_PRIVATE_KEY);
-            return newBIO(buffer);
+            return toBIO(allocator, pem.retain());
         } finally {
-            buffer.release();
+            pem.release();
         }
     }
 
@@ -533,47 +611,65 @@ public abstract class OpenSslContext extends SslContext {
      * Return the pointer to a <a href="https://www.openssl.org/docs/crypto/BIO_get_mem_ptr.html">in-memory BIO</a>
      * or {@code 0} if the {@code certChain} is {@code null}. The BIO contains the content of the {@code certChain}.
      */
-    static long toBIO(X509Certificate[] certChain) throws Exception {
+    static long toBIO(X509Certificate... certChain) throws Exception {
         if (certChain == null) {
             return 0;
         }
-        ByteBuf buffer = Unpooled.directBuffer();
+
+        if (certChain.length == 0) {
+            throw new IllegalArgumentException("certChain can't be empty");
+        }
+
+        ByteBufAllocator allocator = ByteBufAllocator.DEFAULT;
+        PemEncoded pem = PemX509Certificate.toPEM(allocator, true, certChain);
         try {
-            for (X509Certificate cert: certChain) {
-                buffer.writeBytes(BEGIN_CERT);
-                ByteBuf wrappedBuf = Unpooled.wrappedBuffer(cert.getEncoded());
+            return toBIO(allocator, pem.retain());
+        } finally {
+            pem.release();
+        }
+    }
+
+    private static long toBIO(ByteBufAllocator allocator, PemEncoded pem) throws Exception {
+        try {
+            // We can turn direct buffers straight into BIOs. No need to
+            // make a yet another copy.
+            ByteBuf content = pem.content();
+
+            if (content.isDirect()) {
+                return newBIO(content.retainedSlice());
+            }
+
+            ByteBuf buffer = allocator.directBuffer(content.readableBytes());
+            try {
+                buffer.writeBytes(content, content.readerIndex(), content.readableBytes());
+                return newBIO(buffer.retainedSlice());
+            } finally {
                 try {
-                    ByteBuf encodedBuf = Base64.encode(wrappedBuf, true);
-                    try {
-                        buffer.writeBytes(encodedBuf);
-                    } finally {
-                        encodedBuf.release();
+                    // If the contents of the ByteBuf is sensitive (e.g. a PrivateKey) we
+                    // need to zero out the bytes of the copy before we're releasing it.
+                    if (pem.isSensitive()) {
+                        SslUtils.zeroout(buffer);
                     }
                 } finally {
-                    wrappedBuf.release();
+                    buffer.release();
                 }
-                buffer.writeBytes(END_CERT);
             }
-            return newBIO(buffer);
-        }  finally {
-            buffer.release();
+        } finally {
+            pem.release();
         }
     }
 
     private static long newBIO(ByteBuf buffer) throws Exception {
-        long bio = SSL.newMemBIO();
-        int readable = buffer.readableBytes();
-        if (SSL.writeToBIO(bio, OpenSsl.memoryAddress(buffer), readable) != readable) {
-            SSL.freeBIO(bio);
-            throw new IllegalStateException("Could not write data to memory BIO");
-        }
-        return bio;
-    }
-
-    static void checkKeyManagerFactory(KeyManagerFactory keyManagerFactory) {
-        if (keyManagerFactory != null) {
-            throw new IllegalArgumentException(
-                    "KeyManagerFactory is currently not supported with OpenSslContext");
+        try {
+            long bio = SSL.newMemBIO();
+            int readable = buffer.readableBytes();
+            if (SSL.writeToBIO(bio, OpenSsl.memoryAddress(buffer), readable) != readable) {
+                SSL.freeBIO(bio);
+                throw new IllegalStateException("Could not write data to memory BIO");
+            }
+            return bio;
+        } finally {
+            buffer.release();
         }
     }
 }

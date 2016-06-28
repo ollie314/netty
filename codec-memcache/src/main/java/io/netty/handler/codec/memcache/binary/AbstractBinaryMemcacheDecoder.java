@@ -24,6 +24,7 @@ import io.netty.handler.codec.memcache.DefaultLastMemcacheContent;
 import io.netty.handler.codec.memcache.DefaultMemcacheContent;
 import io.netty.handler.codec.memcache.LastMemcacheContent;
 import io.netty.handler.codec.memcache.MemcacheContent;
+import io.netty.util.internal.UnstableApi;
 
 import java.util.List;
 
@@ -32,6 +33,7 @@ import java.util.List;
  * <p/>
  * The difference in the protocols (header) is implemented by the subclasses.
  */
+@UnstableApi
 public abstract class AbstractBinaryMemcacheDecoder<M extends BinaryMemcacheMessage>
     extends AbstractMemcacheObjectDecoder {
 
@@ -87,7 +89,7 @@ public abstract class AbstractBinaryMemcacheDecoder<M extends BinaryMemcacheMess
                         return;
                     }
 
-                    currentMessage.setExtras(in.readSlice(extrasLength).retain());
+                    currentMessage.setExtras(in.readRetainedSlice(extrasLength));
                 }
 
                 state = State.READ_KEY;
@@ -103,7 +105,7 @@ public abstract class AbstractBinaryMemcacheDecoder<M extends BinaryMemcacheMess
                         return;
                     }
 
-                    currentMessage.setKey(in.readSlice(keyLength).retain());
+                    currentMessage.setKey(in.readRetainedSlice(keyLength));
                 }
                 out.add(currentMessage.retain());
                 state = State.READ_CONTENT;
@@ -131,7 +133,7 @@ public abstract class AbstractBinaryMemcacheDecoder<M extends BinaryMemcacheMess
                         toRead = remainingLength;
                     }
 
-                    ByteBuf chunkBuffer = in.readSlice(toRead).retain();
+                    ByteBuf chunkBuffer = in.readRetainedSlice(toRead);
 
                     MemcacheContent chunk;
                     if ((alreadyReadChunkSize += toRead) >= valueLength) {

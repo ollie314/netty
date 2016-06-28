@@ -18,10 +18,12 @@ package io.netty.handler.codec.redis;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.DefaultByteBufHolder;
 import io.netty.util.internal.StringUtil;
+import io.netty.util.internal.UnstableApi;
 
 /**
  * A default implementation of {@link BulkStringRedisContent}.
  */
+@UnstableApi
 public class DefaultBulkStringRedisContent extends DefaultByteBufHolder implements BulkStringRedisContent {
 
     /**
@@ -31,6 +33,50 @@ public class DefaultBulkStringRedisContent extends DefaultByteBufHolder implemen
      */
     public DefaultBulkStringRedisContent(ByteBuf content) {
         super(content);
+    }
+
+    @Override
+    public BulkStringRedisContent copy() {
+        return (BulkStringRedisContent) super.copy();
+    }
+
+    @Override
+    public BulkStringRedisContent duplicate() {
+        return (BulkStringRedisContent) super.duplicate();
+    }
+
+    @Override
+    public BulkStringRedisContent retainedDuplicate() {
+        return (BulkStringRedisContent) super.retainedDuplicate();
+    }
+
+    @Override
+    public BulkStringRedisContent replace(ByteBuf content) {
+        return new DefaultBulkStringRedisContent(content);
+    }
+
+    @Override
+    public BulkStringRedisContent retain() {
+        super.retain();
+        return this;
+    }
+
+    @Override
+    public BulkStringRedisContent retain(int increment) {
+        super.retain(increment);
+        return this;
+    }
+
+    @Override
+    public BulkStringRedisContent touch() {
+        super.touch();
+        return this;
+    }
+
+    @Override
+    public BulkStringRedisContent touch(Object hint) {
+        super.touch(hint);
+        return this;
     }
 
     @Override

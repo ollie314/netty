@@ -20,7 +20,9 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.ReferenceCounted;
 import io.netty.util.ResourceLeak;
 import io.netty.util.ResourceLeakDetector;
+import io.netty.util.ResourceLeakDetectorFactory;
 import io.netty.util.internal.StringUtil;
+import io.netty.util.internal.UnstableApi;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -30,10 +32,11 @@ import static io.netty.util.internal.ObjectUtil.checkNotNull;
 /**
  * A skeletal implementation of {@link DnsMessage}.
  */
+@UnstableApi
 public abstract class AbstractDnsMessage extends AbstractReferenceCounted implements DnsMessage {
 
     private static final ResourceLeakDetector<DnsMessage> leakDetector =
-            new ResourceLeakDetector<DnsMessage>(DnsMessage.class);
+            ResourceLeakDetectorFactory.instance().newResourceLeakDetector(DnsMessage.class);
 
     private static final int SECTION_QUESTION = DnsSection.QUESTION.ordinal();
     private static final int SECTION_COUNT = 4;

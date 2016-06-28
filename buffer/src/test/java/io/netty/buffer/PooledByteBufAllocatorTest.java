@@ -37,6 +37,42 @@ import static org.junit.Assert.assertTrue;
 public class PooledByteBufAllocatorTest {
 
     @Test
+    public void testArenaMetricsNoCache() {
+        testArenaMetrics0(new PooledByteBufAllocator(true, 2, 2, 8192, 11, 0, 0, 0), 100, 0, 100, 100);
+    }
+
+    @Test
+    public void testArenaMetricsCache() {
+        testArenaMetrics0(new PooledByteBufAllocator(true, 2, 2, 8192, 11, 1000, 1000, 1000), 100, 1, 1, 0);
+    }
+
+    private static void testArenaMetrics0(
+            PooledByteBufAllocator allocator, int num, int expectedActive, int expectedAlloc, int expectedDealloc) {
+        for (int i = 0; i < num; i++) {
+            assertTrue(allocator.directBuffer().release());
+            assertTrue(allocator.heapBuffer().release());
+        }
+
+        assertArenaMetrics(allocator.directArenas(), expectedActive, expectedAlloc, expectedDealloc);
+        assertArenaMetrics(allocator.heapArenas(), expectedActive, expectedAlloc, expectedDealloc);
+    }
+
+    private static void assertArenaMetrics(
+            List<PoolArenaMetric> arenaMetrics, int expectedActive, int expectedAlloc, int expectedDealloc) {
+        int active = 0;
+        int alloc = 0;
+        int dealloc = 0;
+        for (PoolArenaMetric arena : arenaMetrics) {
+            active += arena.numActiveAllocations();
+            alloc += arena.numAllocations();
+            dealloc += arena.numDeallocations();
+        }
+        assertEquals(expectedActive, active);
+        assertEquals(expectedAlloc, alloc);
+        assertEquals(expectedDealloc, dealloc);
+    }
+
+    @Test
     public void testPoolChunkListMetric() {
         for (PoolArenaMetric arenaMetric: PooledByteBufAllocator.DEFAULT.heapArenas()) {
             assertPoolChunkListMetric(arenaMetric);
@@ -125,8 +161,8 @@ public class PooledByteBufAllocatorTest {
         assertTrue(threadCachesCreated.get());
     }
 
-    @Test
-    public void testNumThreadCachesWithNoDirectArenas() {
+    @Test(timeout = 3000)
+    public void testNumThreadCachesWithNoDirectArenas() throws InterruptedException {
         int numHeapArenas = 1;
         final PooledByteBufAllocator allocator =
             new PooledByteBufAllocator(numHeapArenas, 0, 8192, 1);
@@ -144,7 +180,7 @@ public class PooledByteBufAllocatorTest {
         assertEquals(0, allocator.numThreadLocalCaches());
     }
 
-    @Test
+    @Test(timeout = 3000)
     public void testThreadCacheToArenaMappings() throws InterruptedException {
         int numArenas = 2;
         final PooledByteBufAllocator allocator =
@@ -188,17 +224,20 @@ public class PooledByteBufAllocatorTest {
         LockSupport.parkNanos(MILLISECONDS.toNanos(100));
     }
 
-    private static CountDownLatch createNewThreadCache(final PooledByteBufAllocator allocator) {
+    private static CountDownLatch createNewThreadCache(final PooledByteBufAllocator allocator)
+            throws InterruptedException {
         final CountDownLatch latch = new CountDownLatch(1);
-
+        final CountDownLatch cacheLatch = new CountDownLatch(1);
         Thread t = new FastThreadLocalThread(new Runnable() {
 
             @Override
             public void run() {
                 ByteBuf buf = allocator.newHeapBuffer(1024, 1024);
-                for (int i = 0; i < buf.capacity(); i++) {
-                    buf.writeByte(0);
-                }
+
+                // Countdown the latch after we allocated a buffer. At this point the cache must exists.
+                cacheLatch.countDown();
+
+                buf.writeZero(buf.capacity());
 
                 try {
                     latch.await();
@@ -213,8 +252,8 @@ public class PooledByteBufAllocatorTest {
         });
         t.start();
 
-        // Wait a bit for the thread & thread cache to be created.
-        LockSupport.parkNanos(MILLISECONDS.toNanos(100));
+        // Wait until we allocated a buffer and so be sure the thread was started and the cache exists.
+        cacheLatch.await();
 
         return latch;
     }

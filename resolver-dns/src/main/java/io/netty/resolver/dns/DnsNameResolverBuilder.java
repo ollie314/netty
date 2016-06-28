@@ -24,6 +24,7 @@ import io.netty.channel.socket.DatagramChannel;
 import io.netty.channel.socket.InternetProtocolFamily;
 import io.netty.resolver.HostsFileEntriesResolver;
 import io.netty.util.internal.InternalThreadLocalMap;
+import io.netty.util.internal.UnstableApi;
 
 import java.net.InetSocketAddress;
 import java.util.List;
@@ -33,6 +34,7 @@ import static io.netty.util.internal.ObjectUtil.checkNotNull;
 /**
  * A {@link DnsNameResolver} builder.
  */
+@UnstableApi
 public final class DnsNameResolverBuilder {
 
     private final EventLoop eventLoop;
@@ -46,7 +48,7 @@ public final class DnsNameResolverBuilder {
     private long queryTimeoutMillis = 5000;
     private InternetProtocolFamily[] resolvedAddressTypes = DnsNameResolver.DEFAULT_RESOLVE_ADDRESS_TYPES;
     private boolean recursionDesired = true;
-    private int maxQueriesPerResolve = 3;
+    private int maxQueriesPerResolve = 16;
     private boolean traceEnabled;
     private int maxPayloadSize = 4096;
     private boolean optResourceEnabled = true;

@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.ReferenceCountUtil;
 import org.junit.Test;
 
 import java.nio.ByteBuffer;
@@ -846,11 +847,11 @@ public abstract class AbstractCompositeByteBufTest extends AbstractByteBufTest {
     public void testAddEmptyBufferInMiddle() {
         CompositeByteBuf cbuf = compositeBuffer();
         ByteBuf buf1 = buffer().writeByte((byte) 1);
-        cbuf.addComponent(buf1).writerIndex(cbuf.writerIndex() + buf1.readableBytes());
+        cbuf.addComponent(true, buf1);
         ByteBuf buf2 = EMPTY_BUFFER;
-        cbuf.addComponent(buf2).writerIndex(cbuf.writerIndex() + buf2.readableBytes());
+        cbuf.addComponent(true, buf2);
         ByteBuf buf3 = buffer().writeByte((byte) 2);
-        cbuf.addComponent(buf3).writerIndex(cbuf.writerIndex() + buf3.readableBytes());
+        cbuf.addComponent(true, buf3);
 
         assertEquals(2, cbuf.readableBytes());
         assertEquals((byte) 1, cbuf.readByte());
@@ -930,4 +931,34 @@ public abstract class AbstractCompositeByteBufTest extends AbstractByteBufTest {
             cbuf.release();
         }
     }
+
+    @Test
+    public void testReleasesItsComponents() {
+        ByteBuf buffer = PooledByteBufAllocator.DEFAULT.buffer(); // 1
+
+        buffer.writeBytes(new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+
+        ByteBuf s1 = buffer.readSlice(2).retain(); // 2
+        ByteBuf s2 = s1.readSlice(2).retain(); // 3
+        ByteBuf s3 = s2.readSlice(2).retain(); // 4
+        ByteBuf s4 = s3.readSlice(2).retain(); // 5
+
+        ByteBuf composite = PooledByteBufAllocator.DEFAULT.compositeBuffer()
+            .addComponent(s1)
+            .addComponents(s2, s3, s4)
+            .order(ByteOrder.LITTLE_ENDIAN);
+
+        assertEquals(composite.refCnt(), 1);
+        assertEquals(buffer.refCnt(), 5);
+
+        // releasing composite should release the 4 components
+        ReferenceCountUtil.release(composite);
+        assertEquals(composite.refCnt(), 0);
+        assertEquals(buffer.refCnt(), 1);
+
+        // last remaining ref to buffer
+        ReferenceCountUtil.release(buffer);
+        assertEquals(buffer.refCnt(), 0);
+    }
+
 }

@@ -19,10 +19,12 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.DefaultByteBufHolder;
 import io.netty.buffer.Unpooled;
 import io.netty.util.internal.StringUtil;
+import io.netty.util.internal.UnstableApi;
 
 /**
  * An aggregated bulk string of <a href="http://redis.io/topics/protocol">RESP</a>.
  */
+@UnstableApi
 public class FullBulkStringRedisMessage extends DefaultByteBufHolder implements LastBulkStringRedisContent {
 
     private FullBulkStringRedisMessage() {
@@ -83,6 +85,11 @@ public class FullBulkStringRedisMessage extends DefaultByteBufHolder implements 
         }
 
         @Override
+        public FullBulkStringRedisMessage retainedDuplicate() {
+            return this;
+        }
+
+        @Override
         public int refCnt() {
             return 1;
         }
@@ -129,11 +136,16 @@ public class FullBulkStringRedisMessage extends DefaultByteBufHolder implements 
 
         @Override
         public FullBulkStringRedisMessage copy() {
-            return EMPTY_INSTANCE;
+            return this;
         }
 
         @Override
         public FullBulkStringRedisMessage duplicate() {
+            return this;
+        }
+
+        @Override
+        public FullBulkStringRedisMessage retainedDuplicate() {
             return this;
         }
 
@@ -172,4 +184,48 @@ public class FullBulkStringRedisMessage extends DefaultByteBufHolder implements 
             return false;
         }
     };
+
+    @Override
+    public FullBulkStringRedisMessage copy() {
+        return (FullBulkStringRedisMessage) super.copy();
+    }
+
+    @Override
+    public FullBulkStringRedisMessage duplicate() {
+        return (FullBulkStringRedisMessage) super.duplicate();
+    }
+
+    @Override
+    public FullBulkStringRedisMessage retainedDuplicate() {
+        return (FullBulkStringRedisMessage) super.retainedDuplicate();
+    }
+
+    @Override
+    public FullBulkStringRedisMessage replace(ByteBuf content) {
+        return new FullBulkStringRedisMessage(content);
+    }
+
+    @Override
+    public FullBulkStringRedisMessage retain() {
+        super.retain();
+        return this;
+    }
+
+    @Override
+    public FullBulkStringRedisMessage retain(int increment) {
+        super.retain(increment);
+        return this;
+    }
+
+    @Override
+    public FullBulkStringRedisMessage touch() {
+        super.touch();
+        return this;
+    }
+
+    @Override
+    public FullBulkStringRedisMessage touch(Object hint) {
+        super.touch(hint);
+        return this;
+    }
 }

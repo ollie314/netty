@@ -32,11 +32,9 @@ import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.socket.DuplexChannel;
 import io.netty.channel.unix.FileDescriptor;
 import io.netty.channel.unix.Socket;
-import io.netty.util.internal.EmptyArrays;
-import io.netty.util.internal.MpscLinkedQueueNode;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
+import io.netty.util.internal.ThrowableUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -58,11 +56,17 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             " (expected: " + StringUtil.simpleClassName(ByteBuf.class) + ", " +
                     StringUtil.simpleClassName(DefaultFileRegion.class) + ')';
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(AbstractEpollStreamChannel.class);
-    static final ClosedChannelException CLOSED_CHANNEL_EXCEPTION = new ClosedChannelException();
-
-    static {
-        CLOSED_CHANNEL_EXCEPTION.setStackTrace(EmptyArrays.EMPTY_STACK_TRACE);
-    }
+    private static final ClosedChannelException DO_CLOSE_CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
+            new ClosedChannelException(), AbstractEpollStreamChannel.class, "doClose()");
+    private static final ClosedChannelException CLEAR_SPLICE_QUEUE_CLOSED_CHANNEL_EXCEPTION =
+            ThrowableUtil.unknownStackTrace(new ClosedChannelException(),
+                    AbstractEpollStreamChannel.class, "clearSpliceQueue()");
+    private static final ClosedChannelException SPLICE_TO_CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
+            new ClosedChannelException(),
+            AbstractEpollStreamChannel.class, "spliceTo(...)");
+    private static final ClosedChannelException FAIL_SPLICE_IF_CLOSED_CLOSED_CHANNEL_EXCEPTION =
+            ThrowableUtil.unknownStackTrace(new ClosedChannelException(),
+            AbstractEpollStreamChannel.class, "failSpliceIfClosed(...)");
 
     /**
      * The future of the current connection attempt.  If not null, subsequent
@@ -172,7 +176,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         }
         checkNotNull(promise, "promise");
         if (!isOpen()) {
-            promise.tryFailure(CLOSED_CHANNEL_EXCEPTION);
+            promise.tryFailure(SPLICE_TO_CLOSED_CHANNEL_EXCEPTION);
         } else {
             addToSpliceQueue(new SpliceInChannelTask(ch, len, promise));
             failSpliceIfClosed(promise);
@@ -225,7 +229,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         }
         checkNotNull(promise, "promise");
         if (!isOpen()) {
-            promise.tryFailure(CLOSED_CHANNEL_EXCEPTION);
+            promise.tryFailure(SPLICE_TO_CLOSED_CHANNEL_EXCEPTION);
         } else {
             addToSpliceQueue(new SpliceFdTask(ch, offset, len, promise));
             failSpliceIfClosed(promise);
@@ -237,8 +241,8 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         if (!isOpen()) {
             // Seems like the Channel was closed in the meantime try to fail the promise to prevent any
             // cases where a future may not be notified otherwise.
-            if (promise.tryFailure(CLOSED_CHANNEL_EXCEPTION)) {
-                eventLoop().execute(new OneTimeTask() {
+            if (promise.tryFailure(FAIL_SPLICE_IF_CLOSED_CLOSED_CHANNEL_EXCEPTION)) {
+                eventLoop().execute(new Runnable() {
                     @Override
                     public void run() {
                         // Call this via the EventLoop as it is a MPSC queue.
@@ -530,7 +534,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
                 "unsupported message type: " + StringUtil.simpleClassName(msg) + EXPECTED_TYPES);
     }
 
-    protected void shutdownOutput0(final ChannelPromise promise) {
+    private void shutdownOutput0(final ChannelPromise promise) {
         try {
             fd().shutdown(false, true);
             promise.setSuccess();
@@ -539,14 +543,37 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         }
     }
 
+    private void shutdownInput0(final ChannelPromise promise) {
+        try {
+            fd().shutdown(true, false);
+            promise.setSuccess();
+        } catch (Throwable cause) {
+            promise.setFailure(cause);
+        }
+    }
+
+    private void shutdown0(final ChannelPromise promise) {
+        try {
+            fd().shutdown(true, true);
+            promise.setSuccess();
+        } catch (Throwable cause) {
+            promise.setFailure(cause);
+        }
+    }
+
+    @Override
+    public boolean isOutputShutdown() {
+        return fd().isOutputShutdown();
+    }
+
     @Override
     public boolean isInputShutdown() {
         return fd().isInputShutdown();
     }
 
     @Override
-    public boolean isOutputShutdown() {
-        return fd().isOutputShutdown();
+    public boolean isShutdown() {
+        return fd().isShutdown();
     }
 
     @Override
@@ -558,7 +585,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
     public ChannelFuture shutdownOutput(final ChannelPromise promise) {
         Executor closeExecutor = ((EpollStreamUnsafe) unsafe()).prepareToClose();
         if (closeExecutor != null) {
-            closeExecutor.execute(new OneTimeTask() {
+            closeExecutor.execute(new Runnable() {
                 @Override
                 public void run() {
                     shutdownOutput0(promise);
@@ -569,10 +596,72 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             if (loop.inEventLoop()) {
                 shutdownOutput0(promise);
             } else {
-                loop.execute(new OneTimeTask() {
+                loop.execute(new Runnable() {
                     @Override
                     public void run() {
                         shutdownOutput0(promise);
+                    }
+                });
+            }
+        }
+        return promise;
+    }
+
+    @Override
+    public ChannelFuture shutdownInput() {
+        return shutdownInput(newPromise());
+    }
+
+    @Override
+    public ChannelFuture shutdownInput(final ChannelPromise promise) {
+        Executor closeExecutor = ((EpollStreamUnsafe) unsafe()).prepareToClose();
+        if (closeExecutor != null) {
+            closeExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    shutdownInput0(promise);
+                }
+            });
+        } else {
+            EventLoop loop = eventLoop();
+            if (loop.inEventLoop()) {
+                shutdownInput0(promise);
+            } else {
+                loop.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        shutdownInput0(promise);
+                    }
+                });
+            }
+        }
+        return promise;
+    }
+
+    @Override
+    public ChannelFuture shutdown() {
+        return shutdown(newPromise());
+    }
+
+    @Override
+    public ChannelFuture shutdown(final ChannelPromise promise) {
+        Executor closeExecutor = ((EpollStreamUnsafe) unsafe()).prepareToClose();
+        if (closeExecutor != null) {
+            closeExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    shutdown0(promise);
+                }
+            });
+        } else {
+            EventLoop loop = eventLoop();
+            if (loop.inEventLoop()) {
+                shutdown0(promise);
+            } else {
+                loop.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        shutdown0(promise);
                     }
                 });
             }
@@ -586,7 +675,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             ChannelPromise promise = connectPromise;
             if (promise != null) {
                 // Use tryFailure() instead of setFailure() to avoid the race against cancel().
-                promise.tryFailure(CLOSED_CHANNEL_EXCEPTION);
+                promise.tryFailure(DO_CLOSE_CLOSED_CHANNEL_EXCEPTION);
                 connectPromise = null;
             }
 
@@ -613,7 +702,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             if (task == null) {
                 break;
             }
-            task.promise.tryFailure(CLOSED_CHANNEL_EXCEPTION);
+            task.promise.tryFailure(CLEAR_SPLICE_QUEUE_CLOSED_CHANNEL_EXCEPTION);
         }
     }
 
@@ -700,7 +789,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
                     // Schedule connect timeout.
                     int connectTimeoutMillis = config().getConnectTimeoutMillis();
                     if (connectTimeoutMillis > 0) {
-                        connectTimeoutFuture = eventLoop().schedule(new OneTimeTask() {
+                        connectTimeoutFuture = eventLoop().schedule(new Runnable() {
                             @Override
                             public void run() {
                                 ChannelPromise connectPromise = AbstractEpollStreamChannel.this.connectPromise;
@@ -907,7 +996,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         if (eventLoop.inEventLoop()) {
             addToSpliceQueue0(task);
         } else {
-            eventLoop.execute(new OneTimeTask() {
+            eventLoop.execute(new Runnable() {
                 @Override
                 public void run() {
                     addToSpliceQueue0(task);
@@ -923,18 +1012,13 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
         spliceQueue.add(task);
     }
 
-    protected abstract class SpliceInTask extends MpscLinkedQueueNode<SpliceInTask> {
+    protected abstract class SpliceInTask {
         final ChannelPromise promise;
         int len;
 
         protected SpliceInTask(int len, ChannelPromise promise) {
             this.promise = promise;
             this.len = len;
-        }
-
-        @Override
-        public SpliceInTask value() {
-            return this;
         }
 
         abstract boolean spliceIn(RecvByteBufAllocator.Handle handle);
@@ -1075,11 +1159,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel im
             this.fd = fd;
             this.promise = promise;
             this.offset = offset;
-        }
-
-        @Override
-        public SpliceFdTask value() {
-            return this;
         }
 
         @Override

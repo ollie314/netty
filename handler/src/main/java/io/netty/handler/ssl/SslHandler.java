@@ -40,9 +40,8 @@ import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.FutureListener;
 import io.netty.util.concurrent.ImmediateExecutor;
 import io.netty.util.concurrent.Promise;
-import io.netty.util.internal.EmptyArrays;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.ThrowableUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -178,15 +177,12 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
      * {@link #unwrap(ChannelHandlerContext, ByteBuf, int,  int)}.  Using this static instance reduce object
      * creation as {@link Unpooled#EMPTY_BUFFER#nioBuffer()} creates a new {@link ByteBuffer} everytime.
      */
-    private static final SSLException SSLENGINE_CLOSED = new SSLException("SSLEngine closed already");
-    private static final SSLException HANDSHAKE_TIMED_OUT = new SSLException("handshake timed out");
-    private static final ClosedChannelException CHANNEL_CLOSED = new ClosedChannelException();
-
-    static {
-        SSLENGINE_CLOSED.setStackTrace(EmptyArrays.EMPTY_STACK_TRACE);
-        HANDSHAKE_TIMED_OUT.setStackTrace(EmptyArrays.EMPTY_STACK_TRACE);
-        CHANNEL_CLOSED.setStackTrace(EmptyArrays.EMPTY_STACK_TRACE);
-    }
+    private static final SSLException SSLENGINE_CLOSED = ThrowableUtil.unknownStackTrace(
+            new SSLException("SSLEngine closed already"), SslHandler.class, "wrap(...)");
+    private static final SSLException HANDSHAKE_TIMED_OUT = ThrowableUtil.unknownStackTrace(
+            new SSLException("handshake timed out"), SslHandler.class, "handshake(...)");
+    private static final ClosedChannelException CHANNEL_CLOSED = ThrowableUtil.unknownStackTrace(
+            new ClosedChannelException(), SslHandler.class, "channelInactive(...)");
 
     private volatile ChannelHandlerContext ctx;
     private final SSLEngine engine;
@@ -389,7 +385,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
      */
     public ChannelFuture close(final ChannelPromise future) {
         final ChannelHandlerContext ctx = this.ctx;
-        ctx.executor().execute(new OneTimeTask() {
+        ctx.executor().execute(new Runnable() {
             @Override
             public void run() {
                 outboundClosed = true;
@@ -1139,7 +1135,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
             }
 
             final CountDownLatch latch = new CountDownLatch(1);
-            delegatedTaskExecutor.execute(new OneTimeTask() {
+            delegatedTaskExecutor.execute(new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -1304,7 +1300,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
 
         EventExecutor executor = ctx.executor();
         if (!executor.inEventLoop()) {
-            executor.execute(new OneTimeTask() {
+            executor.execute(new Runnable() {
                 @Override
                 public void run() {
                     handshake(promise);
@@ -1371,7 +1367,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
             return;
         }
 
-        final ScheduledFuture<?> timeoutFuture = ctx.executor().schedule(new OneTimeTask() {
+        final ScheduledFuture<?> timeoutFuture = ctx.executor().schedule(new Runnable() {
             @Override
             public void run() {
                 if (p.isDone()) {
@@ -1413,7 +1409,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
         final ScheduledFuture<?> timeoutFuture;
         if (closeNotifyTimeoutMillis > 0) {
             // Force-close the connection if close_notify is not fully sent in time.
-            timeoutFuture = ctx.executor().schedule(new OneTimeTask() {
+            timeoutFuture = ctx.executor().schedule(new Runnable() {
                 @Override
                 public void run() {
                     logger.warn("{} Last write attempt timed out; force-closing the connection.", ctx.channel());

@@ -17,10 +17,12 @@ package io.netty.handler.codec.smtp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.DefaultByteBufHolder;
+import io.netty.util.internal.UnstableApi;
 
 /**
  * Default implementation of {@link SmtpContent} that does no validation of the raw data passed in.
  */
+@UnstableApi
 public class DefaultSmtpContent extends DefaultByteBufHolder implements SmtpContent {
 
     /**
@@ -32,12 +34,22 @@ public class DefaultSmtpContent extends DefaultByteBufHolder implements SmtpCont
 
     @Override
     public SmtpContent copy() {
-        return new DefaultSmtpContent(content().copy());
+        return (SmtpContent) super.copy();
     }
 
     @Override
     public SmtpContent duplicate() {
-        return new DefaultSmtpContent(content().duplicate());
+        return (SmtpContent) super.duplicate();
+    }
+
+    @Override
+    public SmtpContent retainedDuplicate() {
+        return (SmtpContent) super.retainedDuplicate();
+    }
+
+    @Override
+    public SmtpContent replace(ByteBuf content) {
+        return new DefaultSmtpContent(content);
     }
 
     @Override
