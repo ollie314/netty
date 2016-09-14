@@ -137,6 +137,7 @@ public final class SslContextBuilder {
     private long sessionCacheSize;
     private long sessionTimeout;
     private ClientAuth clientAuth = ClientAuth.NONE;
+    private boolean startTls;
 
     private SslContextBuilder(boolean forServer) {
         this.forServer = forServer;
@@ -384,13 +385,23 @@ public final class SslContextBuilder {
     }
 
     /**
+     * {@code true} if the first write request shouldn't be encrypted.
+     */
+    public SslContextBuilder startTls(boolean startTls) {
+        this.startTls = startTls;
+        return this;
+    }
+
+    /**
      * Create new {@code SslContext} instance with configured settings.
+     * <p>If {@link #sslProvider(SslProvider)} is set to {@link SslProvider#OPENSSL_REFCNT} then the caller is
+     * responsible for releasing this object, or else native memory may leak.
      */
     public SslContext build() throws SSLException {
         if (forServer) {
             return SslContext.newServerContextInternal(provider, trustCertCollection,
                 trustManagerFactory, keyCertChain, key, keyPassword, keyManagerFactory,
-                ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout, clientAuth);
+                ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout, clientAuth, startTls);
         } else {
             return SslContext.newClientContextInternal(provider, trustCertCollection,
                 trustManagerFactory, keyCertChain, key, keyPassword, keyManagerFactory,

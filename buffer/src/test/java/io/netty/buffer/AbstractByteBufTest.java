@@ -31,6 +31,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.ReadOnlyBufferException;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
@@ -1746,6 +1747,22 @@ public abstract class AbstractByteBufTest {
     }
 
     @Test
+    public void testRetainedSliceIndex() throws Exception {
+        assertEqualsAndRelease(buffer, 0, buffer.retainedSlice(0, buffer.capacity()).readerIndex());
+        assertEqualsAndRelease(buffer, 0, buffer.retainedSlice(0, buffer.capacity() - 1).readerIndex());
+        assertEqualsAndRelease(buffer, 0, buffer.retainedSlice(1, buffer.capacity() - 1).readerIndex());
+        assertEqualsAndRelease(buffer, 0, buffer.retainedSlice(1, buffer.capacity() - 2).readerIndex());
+
+        assertEqualsAndRelease(buffer, buffer.capacity(), buffer.retainedSlice(0, buffer.capacity()).writerIndex());
+        assertEqualsAndRelease(buffer,
+                buffer.capacity() - 1, buffer.retainedSlice(0, buffer.capacity() - 1).writerIndex());
+        assertEqualsAndRelease(buffer,
+                buffer.capacity() - 1, buffer.retainedSlice(1, buffer.capacity() - 1).writerIndex());
+        assertEqualsAndRelease(buffer,
+                buffer.capacity() - 2, buffer.retainedSlice(1, buffer.capacity() - 2).writerIndex());
+    }
+
+    @Test
     @SuppressWarnings("ObjectEqualsNull")
     public void testEquals() {
         assertFalse(buffer.equals(null));
@@ -1801,6 +1818,31 @@ public abstract class AbstractByteBufTest {
         assertTrue(buffer.compareTo(wrappedBuffer(value, 0, 31).order(LITTLE_ENDIAN)) > 0);
         assertTrue(buffer.slice(0, 31).compareTo(wrappedBuffer(value)) < 0);
         assertTrue(buffer.slice(0, 31).compareTo(wrappedBuffer(value).order(LITTLE_ENDIAN)) < 0);
+        assertTrueAndRelease(buffer, buffer.retainedSlice(0, 31).compareTo(wrappedBuffer(value)) < 0);
+        assertTrueAndRelease(buffer,
+                buffer.retainedSlice(0, 31).compareTo(wrappedBuffer(value).order(LITTLE_ENDIAN)) < 0);
+    }
+
+    @Test
+    public void testCompareTo2() {
+        byte[] bytes = {1, 2, 3, 4};
+        byte[] bytesReversed = {4, 3, 2, 1};
+
+        ByteBuf buf1 = newBuffer(4).clear().writeBytes(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuf buf2 = newBuffer(4).clear().writeBytes(bytesReversed).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuf buf3 = newBuffer(4).clear().writeBytes(bytes).order(ByteOrder.BIG_ENDIAN);
+        ByteBuf buf4 = newBuffer(4).clear().writeBytes(bytesReversed).order(ByteOrder.BIG_ENDIAN);
+        try {
+            assertEquals(buf1.compareTo(buf2), buf3.compareTo(buf4));
+            assertEquals(buf2.compareTo(buf1), buf4.compareTo(buf3));
+            assertEquals(buf1.compareTo(buf3), buf2.compareTo(buf4));
+            assertEquals(buf3.compareTo(buf1), buf4.compareTo(buf2));
+        } finally {
+            buf1.release();
+            buf2.release();
+            buf3.release();
+            buf4.release();
+        }
     }
 
     @Test
@@ -2839,6 +2881,171 @@ public abstract class AbstractByteBufTest {
         assertEquals(0, buf.refCnt());
     }
 
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testRetainedSliceIndexOutOfBounds() {
+        testSliceOutOfBounds(true, true, true);
+    }
+
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testRetainedSliceLengthOutOfBounds() {
+        testSliceOutOfBounds(true, true, false);
+    }
+
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testMixedSliceAIndexOutOfBounds() {
+        testSliceOutOfBounds(true, false, true);
+    }
+
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testMixedSliceALengthOutOfBounds() {
+        testSliceOutOfBounds(true, false, false);
+    }
+
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testMixedSliceBIndexOutOfBounds() {
+        testSliceOutOfBounds(false, true, true);
+    }
+
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testMixedSliceBLengthOutOfBounds() {
+        testSliceOutOfBounds(false, true, false);
+    }
+
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testSliceIndexOutOfBounds() {
+        testSliceOutOfBounds(false, false, true);
+    }
+
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testSliceLengthOutOfBounds() {
+        testSliceOutOfBounds(false, false, false);
+    }
+
+    @Test
+    public void testRetainedSliceContents() {
+        testSliceContents(true);
+    }
+
+    @Test
+    public void testSliceContents() {
+        testSliceContents(false);
+    }
+
+    @Test
+    public void testRetainedDuplicateContents() {
+        testDuplicateContents(true);
+    }
+
+    @Test
+    public void testDuplicateContents() {
+        testDuplicateContents(false);
+    }
+
+    @Test
+    public void testDuplicateCapacityChange() {
+        testDuplicateCapacityChange(false);
+    }
+
+    @Test
+    public void testRetainedDuplicateCapacityChange() {
+        testDuplicateCapacityChange(true);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testSliceCapacityChange() {
+        testSliceCapacityChange(false);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testRetainedSliceCapacityChange() {
+        testSliceCapacityChange(true);
+    }
+
+    private void testDuplicateCapacityChange(boolean retainedDuplicate) {
+        ByteBuf buf = releaseLater(newBuffer(8));
+        ByteBuf dup = retainedDuplicate ? buf.retainedDuplicate() : buf.duplicate();
+        try {
+            dup.capacity(10);
+            assertEquals(buf.capacity(), dup.capacity());
+            dup.capacity(5);
+            assertEquals(buf.capacity(), dup.capacity());
+        } finally {
+            if (retainedDuplicate) {
+                dup.release();
+            }
+        }
+    }
+
+    private void testSliceCapacityChange(boolean retainedSlice) {
+        ByteBuf buf = releaseLater(newBuffer(8));
+        ByteBuf slice = retainedSlice ? buf.retainedSlice(buf.readerIndex() + 1, 3)
+                                      : buf.slice(buf.readerIndex() + 1, 3);
+        try {
+            slice.capacity(10);
+        } finally {
+            if (retainedSlice) {
+                slice.release();
+            }
+        }
+    }
+
+    private void testSliceOutOfBounds(boolean initRetainedSlice, boolean finalRetainedSlice, boolean indexOutOfBounds) {
+        ByteBuf buf = releaseLater(newBuffer(8));
+        ByteBuf slice = initRetainedSlice ? buf.retainedSlice(buf.readerIndex() + 1, 2)
+                                          : buf.slice(buf.readerIndex() + 1, 2);
+        try {
+            assertEquals(2, slice.capacity());
+            assertEquals(2, slice.maxCapacity());
+            final int index = indexOutOfBounds ? 3 : 0;
+            final int length = indexOutOfBounds ? 0 : 3;
+            if (finalRetainedSlice) {
+                // This is expected to fail ... so no need to release.
+                slice.retainedSlice(index, length);
+            } else {
+                slice.slice(index, length);
+            }
+        } finally {
+            if (initRetainedSlice) {
+                slice.release();
+            }
+        }
+    }
+
+    private void testSliceContents(boolean retainedSlice) {
+        ByteBuf buf = releaseLater(newBuffer(8)).resetWriterIndex();
+        ByteBuf expected = releaseLater(newBuffer(3)).resetWriterIndex();
+        buf.writeBytes(new byte[] {1, 2, 3, 4, 5, 6, 7, 8});
+        expected.writeBytes(new byte[] {4, 5, 6});
+        ByteBuf slice = retainedSlice ? buf.retainedSlice(buf.readerIndex() + 3, 3)
+                                      : buf.slice(buf.readerIndex() + 3, 3);
+        try {
+            assertEquals(0, slice.compareTo(expected));
+            assertEquals(0, slice.compareTo(slice.duplicate()));
+            assertEquals(0, slice.compareTo(releaseLater(slice.retainedDuplicate())));
+            assertEquals(0, slice.compareTo(slice.slice(0, slice.capacity())));
+        } finally {
+            if (retainedSlice) {
+                slice.release();
+            }
+        }
+    }
+
+    private void testDuplicateContents(boolean retainedDuplicate) {
+        ByteBuf buf = releaseLater(newBuffer(8)).resetWriterIndex();
+        buf.writeBytes(new byte[] {1, 2, 3, 4, 5, 6, 7, 8});
+        ByteBuf dup = retainedDuplicate ? buf.retainedDuplicate() : buf.duplicate();
+        try {
+            assertEquals(0, dup.compareTo(buf));
+            assertEquals(0, dup.compareTo(dup.duplicate()));
+            assertEquals(0, dup.compareTo(releaseLater(dup.retainedDuplicate())));
+            assertEquals(0, dup.compareTo(dup.slice(0, dup.capacity())));
+        } finally {
+            if (retainedDuplicate) {
+                dup.release();
+            }
+        }
+    }
+
     @Test
     public void testDuplicateRelease() {
         ByteBuf buf = newBuffer(8);
@@ -2994,6 +3201,68 @@ public abstract class AbstractByteBufTest {
         assertEquals(0, buffer.refCnt());
         assertTrue(buffer2.release());
         assertEquals(0, buffer2.refCnt());
+    }
+
+    @Test
+    public void testForEachByteDesc2() {
+        byte[] expected = {1, 2, 3, 4};
+        ByteBuf buf = newBuffer(expected.length);
+        try {
+            buf.writeBytes(expected);
+            final byte[] bytes = new byte[expected.length];
+            int i = buf.forEachByteDesc(new ByteProcessor() {
+                private int index = bytes.length - 1;
+
+                @Override
+                public boolean process(byte value) throws Exception {
+                    bytes[index--] = value;
+                    return true;
+                }
+            });
+            assertEquals(-1, i);
+            assertArrayEquals(expected, bytes);
+        } finally {
+            buf.release();
+        }
+    }
+
+    @Test
+    public void testForEachByte2() {
+        byte[] expected = {1, 2, 3, 4};
+        ByteBuf buf = newBuffer(expected.length);
+        try {
+            buf.writeBytes(expected);
+            final byte[] bytes = new byte[expected.length];
+            int i = buf.forEachByte(new ByteProcessor() {
+                private int index;
+
+                @Override
+                public boolean process(byte value) throws Exception {
+                    bytes[index++] = value;
+                    return true;
+                }
+            });
+            assertEquals(-1, i);
+            assertArrayEquals(expected, bytes);
+        } finally {
+            buf.release();
+        }
+    }
+
+    private static void assertTrueAndRelease(ByteBuf buf, boolean actual) {
+        try {
+            assertTrue(actual);
+        } finally {
+            buf.release();
+        }
+    }
+
+    private static void assertEqualsAndRelease(ByteBuf buf, int expected, int actual) {
+        try {
+            assertEquals(expected, actual);
+        } finally {
+            buf.release();
+        }
     }
 
     private void testRefCnt0(final boolean parameter) throws Exception {

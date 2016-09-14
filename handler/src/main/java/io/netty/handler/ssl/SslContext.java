@@ -93,6 +93,8 @@ public abstract class SslContext {
         }
     }
 
+    private final boolean startTls;
+
     /**
      * Returns the default server-side implementation provider currently in use.
      *
@@ -382,7 +384,7 @@ public abstract class SslContext {
                                             toX509Certificates(keyCertChainFile),
                                             toPrivateKey(keyFile, keyPassword),
                                             keyPassword, keyManagerFactory, ciphers, cipherFilter, apn,
-                                            sessionCacheSize, sessionTimeout, ClientAuth.NONE);
+                                            sessionCacheSize, sessionTimeout, ClientAuth.NONE, false);
         } catch (Exception e) {
             if (e instanceof SSLException) {
                 throw (SSLException) e;
@@ -396,8 +398,7 @@ public abstract class SslContext {
             X509Certificate[] trustCertCollection, TrustManagerFactory trustManagerFactory,
             X509Certificate[] keyCertChain, PrivateKey key, String keyPassword, KeyManagerFactory keyManagerFactory,
             Iterable<String> ciphers, CipherSuiteFilter cipherFilter, ApplicationProtocolConfig apn,
-            long sessionCacheSize, long sessionTimeout,
-            ClientAuth clientAuth) throws SSLException {
+            long sessionCacheSize, long sessionTimeout, ClientAuth clientAuth, boolean startTls) throws SSLException {
 
         if (provider == null) {
             provider = defaultServerProvider();
@@ -408,12 +409,17 @@ public abstract class SslContext {
             return new JdkSslServerContext(
                     trustCertCollection, trustManagerFactory, keyCertChain, key, keyPassword,
                     keyManagerFactory, ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout,
-                    clientAuth);
+                    clientAuth, startTls);
         case OPENSSL:
             return new OpenSslServerContext(
                     trustCertCollection, trustManagerFactory, keyCertChain, key, keyPassword,
                     keyManagerFactory, ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout,
-                    clientAuth);
+                    clientAuth, startTls);
+        case OPENSSL_REFCNT:
+            return new ReferenceCountedOpenSslServerContext(
+                    trustCertCollection, trustManagerFactory, keyCertChain, key, keyPassword,
+                    keyManagerFactory, ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout,
+                    clientAuth, startTls);
         default:
             throw new Error(provider.toString());
         }
@@ -749,9 +755,13 @@ public abstract class SslContext {
                 return new OpenSslClientContext(
                         trustCert, trustManagerFactory, keyCertChain, key, keyPassword,
                         keyManagerFactory, ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout);
+            case OPENSSL_REFCNT:
+                return new ReferenceCountedOpenSslClientContext(
+                        trustCert, trustManagerFactory, keyCertChain, key, keyPassword,
+                        keyManagerFactory, ciphers, cipherFilter, apn, sessionCacheSize, sessionTimeout);
+            default:
+                throw new Error(provider.toString());
         }
-        // Should never happen!!
-        throw new Error();
     }
 
     static ApplicationProtocolConfig toApplicationProtocolConfig(Iterable<String> nextProtocols) {
@@ -767,9 +777,18 @@ public abstract class SslContext {
     }
 
     /**
+     * Creates a new instance (startTls set to <code>false</code>).
+     */
+    protected SslContext() {
+        this(false);
+    }
+
+    /**
      * Creates a new instance.
      */
-    protected SslContext() { }
+    protected SslContext(boolean startTls) {
+        this.startTls = startTls;
+    }
 
     /**
      * Returns {@code true} if and only if this context is for server-side.
@@ -813,14 +832,17 @@ public abstract class SslContext {
 
     /**
      * Creates a new {@link SSLEngine}.
-     *
+     * <p>If {@link SslProvider#OPENSSL_REFCNT} is used then the object must be released. One way to do this is to
+     * wrap in a {@link SslHandler} and insert it into a pipeline. See {@link #newHandler(ByteBufAllocator)}.
      * @return a new {@link SSLEngine}
      */
     public abstract SSLEngine newEngine(ByteBufAllocator alloc);
 
     /**
      * Creates a new {@link SSLEngine} using advisory peer information.
-     *
+     * <p>If {@link SslProvider#OPENSSL_REFCNT} is used then the object must be released. One way to do this is to
+     * wrap in a {@link SslHandler} and insert it into a pipeline.
+     * See {@link #newHandler(ByteBufAllocator, String, int)}.
      * @param peerHost the non-authoritative name of the host
      * @param peerPort the non-authoritative port
      *
@@ -835,27 +857,27 @@ public abstract class SslContext {
 
     /**
      * Creates a new {@link SslHandler}.
-     *
+     * <p>If {@link SslProvider#OPENSSL_REFCNT} is used then the returned {@link SslHandler} will release the engine
+     * that is wrapped. If the returned {@link SslHandler} is not inserted into a pipeline then you may leak native
+     * memory!
      * @return a new {@link SslHandler}
      */
     public final SslHandler newHandler(ByteBufAllocator alloc) {
-        return newHandler(newEngine(alloc));
+        return new SslHandler(newEngine(alloc), startTls);
     }
 
     /**
      * Creates a new {@link SslHandler} with advisory peer information.
-     *
+     * <p>If {@link SslProvider#OPENSSL_REFCNT} is used then the returned {@link SslHandler} will release the engine
+     * that is wrapped. If the returned {@link SslHandler} is not inserted into a pipeline then you may leak native
+     * memory!
      * @param peerHost the non-authoritative name of the host
      * @param peerPort the non-authoritative port
      *
      * @return a new {@link SslHandler}
      */
     public final SslHandler newHandler(ByteBufAllocator alloc, String peerHost, int peerPort) {
-        return newHandler(newEngine(alloc, peerHost, peerPort));
-    }
-
-    private static SslHandler newHandler(SSLEngine engine) {
-        return new SslHandler(engine);
+        return new SslHandler(newEngine(alloc, peerHost, peerPort), startTls);
     }
 
     /**

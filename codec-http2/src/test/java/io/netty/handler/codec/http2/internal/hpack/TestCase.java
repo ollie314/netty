@@ -61,10 +61,7 @@ final class TestCase {
             .create();
 
     int maxHeaderTableSize = -1;
-    boolean useIndexing = true;
     boolean sensitiveHeaders;
-    boolean forceHuffmanOn;
-    boolean forceHuffmanOff;
 
     List<HeaderBlock> headerBlocks;
 
@@ -161,7 +158,7 @@ final class TestCase {
             maxHeaderTableSize = Integer.MAX_VALUE;
         }
 
-        return new Encoder(maxHeaderTableSize, useIndexing, forceHuffmanOn, forceHuffmanOff);
+        return new Encoder(maxHeaderTableSize);
     }
 
     private Decoder createDecoder() {
@@ -192,13 +189,12 @@ final class TestCase {
         }
     }
 
-    private static List<HeaderField> decode(Decoder decoder, byte[] expected) throws IOException {
+    private static List<HeaderField> decode(Decoder decoder, byte[] expected) throws Exception {
         ByteBuf in = Unpooled.wrappedBuffer(expected);
         try {
             List<HeaderField> headers = new ArrayList<HeaderField>();
             TestHeaderListener listener = new TestHeaderListener(headers);
             decoder.decode(in, listener);
-            decoder.endHeaderBlock();
             return headers;
         } finally {
             in.release();

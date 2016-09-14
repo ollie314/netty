@@ -109,7 +109,7 @@ public class ResourceLeakDetector<T> {
     }
 
     // Should be power of two.
-    private static final int DEFAULT_SAMPLING_INTERVAL = 128;
+    static final int DEFAULT_SAMPLING_INTERVAL = 128;
 
     /**
      * @deprecated Use {@link #setLevel(Level)} instead.
@@ -159,31 +159,46 @@ public class ResourceLeakDetector<T> {
 
     private long leakCheckCnt;
 
+    /**
+     * @deprecated use {@link ResourceLeakDetectorFactory#newResourceLeakDetector(Class, int, long)}.
+     */
+    @Deprecated
     public ResourceLeakDetector(Class<?> resourceType) {
         this(simpleClassName(resourceType));
     }
 
+    /**
+     * @deprecated use {@link ResourceLeakDetectorFactory#newResourceLeakDetector(Class, int, long)}.
+     */
+    @Deprecated
     public ResourceLeakDetector(String resourceType) {
         this(resourceType, DEFAULT_SAMPLING_INTERVAL, Long.MAX_VALUE);
     }
 
+    /**
+     * This should not be used directly by users of {@link ResourceLeakDetector}.
+     * Please use {@link ResourceLeakDetectorFactory#newResourceLeakDetector(Class)}
+     * or {@link ResourceLeakDetectorFactory#newResourceLeakDetector(Class, int, long)}
+     */
+    @SuppressWarnings("deprecation")
     public ResourceLeakDetector(Class<?> resourceType, int samplingInterval, long maxActive) {
         this(simpleClassName(resourceType), samplingInterval, maxActive);
     }
 
+    /**
+     * @deprecated use {@link ResourceLeakDetectorFactory#newResourceLeakDetector(Class, int, long)}.
+     */
+    @Deprecated
     public ResourceLeakDetector(String resourceType, int samplingInterval, long maxActive) {
         if (resourceType == null) {
             throw new NullPointerException("resourceType");
-        }
-        if (samplingInterval <= 0) {
-            throw new IllegalArgumentException("samplingInterval: " + samplingInterval + " (expected: 1+)");
         }
         if (maxActive <= 0) {
             throw new IllegalArgumentException("maxActive: " + maxActive + " (expected: 1+)");
         }
 
         this.resourceType = resourceType;
-        this.samplingInterval = MathUtil.findNextPositivePowerOfTwo(samplingInterval);
+        this.samplingInterval = MathUtil.safeFindNextPositivePowerOfTwo(samplingInterval);
         // samplingInterval is a power of two so we calculate a mask that we can use to
         // check if we need to do any leak detection or not.
         mask = this.samplingInterval - 1;
@@ -199,7 +214,7 @@ public class ResourceLeakDetector<T> {
      *
      * @return the {@link ResourceLeak} or {@code null}
      */
-    public ResourceLeak open(T obj) {
+    public final ResourceLeak open(T obj) {
         Level level = ResourceLeakDetector.level;
         if (level == Level.DISABLED) {
             return null;

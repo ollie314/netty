@@ -172,6 +172,7 @@ public class PendingWriteQueueTest {
     private static void assertQueueEmpty(PendingWriteQueue queue) {
         assertTrue(queue.isEmpty());
         assertEquals(0, queue.size());
+        assertEquals(0, queue.bytes());
         assertNull(queue.current());
         assertNull(queue.removeAndWrite());
         assertNull(queue.removeAndWriteAll());
@@ -224,6 +225,43 @@ public class PendingWriteQueueTest {
         assertTrue(promise2.isDone());
         assertFalse(promise2.isSuccess());
         assertFalse(channel.finish());
+    }
+
+    @Test
+    public void testRemoveAndWriteAllReentrantWrite() {
+        EmbeddedChannel channel = new EmbeddedChannel(new ChannelOutboundHandlerAdapter() {
+            @Override
+            public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+                // Convert to writeAndFlush(...) so the promise will be notified by the transport.
+                ctx.writeAndFlush(msg, promise);
+            }
+        }, new ChannelOutboundHandlerAdapter());
+
+        final PendingWriteQueue queue = new PendingWriteQueue(channel.pipeline().lastContext());
+
+        ChannelPromise promise = channel.newPromise();
+        final ChannelPromise promise3 = channel.newPromise();
+        promise.addListener(new ChannelFutureListener() {
+            @Override
+            public void operationComplete(ChannelFuture future) {
+                queue.add(3L, promise3);
+            }
+        });
+        queue.add(1L, promise);
+        ChannelPromise promise2 = channel.newPromise();
+        queue.add(2L, promise2);
+        queue.removeAndWriteAll();
+
+        assertTrue(promise.isDone());
+        assertTrue(promise.isSuccess());
+        assertTrue(promise2.isDone());
+        assertTrue(promise2.isSuccess());
+        assertTrue(promise3.isDone());
+        assertTrue(promise3.isSuccess());
+        assertTrue(channel.finish());
+        assertEquals(1L, channel.readOutbound());
+        assertEquals(2L, channel.readOutbound());
+        assertEquals(3L, channel.readOutbound());
     }
 
     @Test

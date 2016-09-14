@@ -19,7 +19,6 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.handler.codec.Headers;
 import io.netty.util.AsciiString;
-import io.netty.util.internal.StringUtil;
 
 import java.text.ParseException;
 import java.util.Calendar;
@@ -1088,7 +1087,7 @@ public abstract class HttpHeaders implements Iterable<Map.Entry<String, String>>
      * @deprecated Use {@link HttpUtil#set100ContinueExpected(HttpMessage, boolean)} instead.
      *
      * Sets or removes the {@code "Expect: 100-continue"} header to / from the
-     * specified message.  If the specified {@code value} is {@code true},
+     * specified message.  If {@code set} is {@code true},
      * the {@code "Expect: 100-continue"} header is set and all other previous
      * {@code "Expect"} headers are removed.  Otherwise, all {@code "Expect"}
      * headers are removed completely.
@@ -1591,7 +1590,7 @@ public abstract class HttpHeaders implements Iterable<Map.Entry<String, String>>
     }
 
     private static boolean contains(String value, CharSequence expected, boolean ignoreCase) {
-        String[] parts = StringUtil.split(value, ',');
+        String[] parts = value.split(",");
         if (ignoreCase) {
             for (String s: parts) {
                 if (AsciiString.contentEqualsIgnoreCase(expected, s.trim())) {

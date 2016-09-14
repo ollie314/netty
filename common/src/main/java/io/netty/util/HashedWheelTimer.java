@@ -76,9 +76,8 @@ public class HashedWheelTimer implements Timer {
     static final InternalLogger logger =
             InternalLoggerFactory.getInstance(HashedWheelTimer.class);
 
-    private static final ResourceLeakDetector<HashedWheelTimer> leakDetector =
-            new ResourceLeakDetector<HashedWheelTimer>(
-                    HashedWheelTimer.class, 1, Runtime.getRuntime().availableProcessors() * 4);
+    private static final ResourceLeakDetector<HashedWheelTimer> leakDetector = ResourceLeakDetectorFactory.instance()
+            .newResourceLeakDetector(HashedWheelTimer.class, 1, Runtime.getRuntime().availableProcessors() * 4L);
 
     private static final AtomicIntegerFieldUpdater<HashedWheelTimer> WORKER_STATE_UPDATER;
     static {
@@ -190,6 +189,26 @@ public class HashedWheelTimer implements Timer {
     public HashedWheelTimer(
             ThreadFactory threadFactory,
             long tickDuration, TimeUnit unit, int ticksPerWheel) {
+        this(threadFactory, tickDuration, unit, ticksPerWheel, true);
+    }
+
+    /**
+     * Creates a new timer.
+     *
+     * @param threadFactory  a {@link ThreadFactory} that creates a
+     *                       background {@link Thread} which is dedicated to
+     *                       {@link TimerTask} execution.
+     * @param tickDuration   the duration between tick
+     * @param unit           the time unit of the {@code tickDuration}
+     * @param ticksPerWheel  the size of the wheel
+     * @param leakDetection  {@code true} if leak detection should be enabled always, if false it will only be enabled
+     *                       if the worker thread is not a daemon thread.
+     * @throws NullPointerException     if either of {@code threadFactory} and {@code unit} is {@code null}
+     * @throws IllegalArgumentException if either of {@code tickDuration} and {@code ticksPerWheel} is &lt;= 0
+     */
+    public HashedWheelTimer(
+            ThreadFactory threadFactory,
+            long tickDuration, TimeUnit unit, int ticksPerWheel, boolean leakDetection) {
 
         if (threadFactory == null) {
             throw new NullPointerException("threadFactory");
@@ -219,7 +238,7 @@ public class HashedWheelTimer implements Timer {
         }
         workerThread = threadFactory.newThread(worker);
 
-        leak = leakDetector.open(this);
+        leak = leakDetection || !workerThread.isDaemon() ? leakDetector.open(this) : null;
     }
 
     private static HashedWheelBucket[] createWheel(int ticksPerWheel) {

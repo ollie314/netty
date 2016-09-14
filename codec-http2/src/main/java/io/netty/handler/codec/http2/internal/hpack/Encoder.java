@@ -37,51 +37,45 @@ import io.netty.util.CharsetUtil;
 
 import java.util.Arrays;
 
+import static io.netty.handler.codec.http2.Http2CodecUtil.MAX_HEADER_TABLE_SIZE;
+import static io.netty.handler.codec.http2.Http2CodecUtil.MIN_HEADER_TABLE_SIZE;
 import static io.netty.handler.codec.http2.internal.hpack.HpackUtil.IndexType.INCREMENTAL;
 import static io.netty.handler.codec.http2.internal.hpack.HpackUtil.IndexType.NEVER;
 import static io.netty.handler.codec.http2.internal.hpack.HpackUtil.IndexType.NONE;
 import static io.netty.handler.codec.http2.internal.hpack.HpackUtil.equalsConstantTime;
+import static io.netty.util.internal.MathUtil.findNextPositivePowerOfTwo;
+import static java.lang.Math.max;
+import static java.lang.Math.min;
 
 public final class Encoder {
-
-    private static final int BUCKET_SIZE = 17;
-
-    // for testing
-    private final boolean useIndexing;
-    private final boolean forceHuffmanOn;
-    private final boolean forceHuffmanOff;
-    private final HuffmanEncoder huffmanEncoder = new HuffmanEncoder();
-
     // a linked hash map of header fields
-    private final HeaderEntry[] headerFields = new HeaderEntry[BUCKET_SIZE];
+    private final HeaderEntry[] headerFields;
     private final HeaderEntry head = new HeaderEntry(-1, AsciiString.EMPTY_STRING,
             AsciiString.EMPTY_STRING, Integer.MAX_VALUE, null);
-    private int size;
-    private int capacity;
+    private final HuffmanEncoder huffmanEncoder = new HuffmanEncoder();
+    private final byte hashMask;
+    private long size;
+    private long capacity;
 
     /**
      * Creates a new encoder.
      */
-    public Encoder(int maxHeaderTableSize) {
-        this(maxHeaderTableSize, true, false, false);
+    public Encoder(long maxHeaderTableSize) {
+        this(maxHeaderTableSize, 16);
     }
 
     /**
-     * Constructor for testing only.
+     * Creates a new encoder.
      */
-    Encoder(
-            int maxHeaderTableSize,
-            boolean useIndexing,
-            boolean forceHuffmanOn,
-            boolean forceHuffmanOff
-    ) {
-        if (maxHeaderTableSize < 0) {
-            throw new IllegalArgumentException("Illegal Capacity: " + maxHeaderTableSize);
+    public Encoder(long maxHeaderTableSize, int arraySizeHint) {
+        if (maxHeaderTableSize < MIN_HEADER_TABLE_SIZE || maxHeaderTableSize > MAX_HEADER_TABLE_SIZE) {
+            throw new IllegalArgumentException("maxHeaderTableSize is invalid: " + maxHeaderTableSize);
         }
-        this.useIndexing = useIndexing;
-        this.forceHuffmanOn = forceHuffmanOn;
-        this.forceHuffmanOff = forceHuffmanOff;
         capacity = maxHeaderTableSize;
+        // Enforce a bound of [2, 128] because hashMask is a byte. The max possible value of hashMask is one less
+        // than the length of this array, and we want the mask to be > 0.
+        headerFields = new HeaderEntry[findNextPositivePowerOfTwo(max(2, min(arraySizeHint, 128)))];
+        hashMask = (byte) (headerFields.length - 1);
         head.before = head.after = head;
     }
 
@@ -131,16 +125,9 @@ public final class Encoder {
                 // Section 6.1. Indexed Header Field Representation
                 encodeInteger(out, 0x80, 7, staticTableIndex);
             } else {
-                int nameIndex = getNameIndex(name);
-                if (useIndexing) {
-                    ensureCapacity(headerSize);
-                }
-                HpackUtil.IndexType indexType =
-                        useIndexing ? INCREMENTAL : NONE;
-                encodeLiteral(out, name, value, indexType, nameIndex);
-                if (useIndexing) {
-                    add(name, value);
-                }
+                ensureCapacity(headerSize);
+                encodeLiteral(out, name, value, INCREMENTAL, getNameIndex(name));
+                add(name, value);
             }
         }
     }
@@ -148,22 +135,23 @@ public final class Encoder {
     /**
      * Set the maximum table size.
      */
-    public void setMaxHeaderTableSize(ByteBuf out, int maxHeaderTableSize) {
-        if (maxHeaderTableSize < 0) {
-            throw new IllegalArgumentException("Illegal Capacity: " + maxHeaderTableSize);
+    public void setMaxHeaderTableSize(ByteBuf out, long maxHeaderTableSize) {
+        if (maxHeaderTableSize < MIN_HEADER_TABLE_SIZE || maxHeaderTableSize > MAX_HEADER_TABLE_SIZE) {
+            throw new IllegalArgumentException("maxHeaderTableSize is invalid: " + maxHeaderTableSize);
         }
         if (capacity == maxHeaderTableSize) {
             return;
         }
         capacity = maxHeaderTableSize;
         ensureCapacity(0);
-        encodeInteger(out, 0x20, 5, maxHeaderTableSize);
+        // Casting to integer is safe as we verified the maxHeaderTableSize is a valid unsigned int.
+        encodeInteger(out, 0x20, 5, (int) maxHeaderTableSize);
     }
 
     /**
      * Return the maximum table size.
      */
-    public int getMaxHeaderTableSize() {
+    public long getMaxHeaderTableSize() {
         return capacity;
     }
 
@@ -171,24 +159,17 @@ public final class Encoder {
      * Encode integer according to Section 5.1.
      */
     private static void encodeInteger(ByteBuf out, int mask, int n, int i) {
-        if (n < 0 || n > 8) {
-            throw new IllegalArgumentException("N: " + n);
-        }
+        assert n >= 0 && n <= 8 : "N: " + n;
         int nbits = 0xFF >>> (8 - n);
         if (i < nbits) {
             out.writeByte(mask | i);
         } else {
             out.writeByte(mask | nbits);
             int length = i - nbits;
-            for (;;) {
-                if ((length & ~0x7F) == 0) {
-                    out.writeByte(length);
-                    return;
-                } else {
-                    out.writeByte((length & 0x7F) | 0x80);
-                    length >>>= 7;
-                }
+            for (; (length & ~0x7F) != 0; length >>>= 7) {
+                out.writeByte((length & 0x7F) | 0x80);
             }
+            out.writeByte(length);
         }
     }
 
@@ -197,7 +178,7 @@ public final class Encoder {
      */
     private void encodeStringLiteral(ByteBuf out, CharSequence string) {
         int huffmanLength = huffmanEncoder.getEncodedLength(string);
-        if ((huffmanLength < string.length() && !forceHuffmanOff) || forceHuffmanOn) {
+        if (huffmanLength < string.length()) {
             encodeInteger(out, 0x80, 7, huffmanLength);
             huffmanEncoder.encode(out, string);
         } else {
@@ -219,26 +200,21 @@ public final class Encoder {
      */
     private void encodeLiteral(ByteBuf out, CharSequence name, CharSequence value, HpackUtil.IndexType indexType,
                                int nameIndex) {
-        int mask;
-        int prefixBits;
+        boolean nameIndexValid = nameIndex != -1;
         switch (indexType) {
             case INCREMENTAL:
-                mask = 0x40;
-                prefixBits = 6;
+                encodeInteger(out, 0x40, 6, nameIndexValid ? nameIndex : 0);
                 break;
             case NONE:
-                mask = 0x00;
-                prefixBits = 4;
+                encodeInteger(out, 0x00, 4, nameIndexValid ? nameIndex : 0);
                 break;
             case NEVER:
-                mask = 0x10;
-                prefixBits = 4;
+                encodeInteger(out, 0x10, 4, nameIndexValid ? nameIndex : 0);
                 break;
             default:
-                throw new IllegalStateException("should not reach here");
+                throw new Error("should not reach here");
         }
-        encodeInteger(out, mask, prefixBits, nameIndex == -1 ? 0 : nameIndex);
-        if (nameIndex == -1) {
+        if (!nameIndexValid) {
             encodeStringLiteral(out, name);
         }
         encodeStringLiteral(out, value);
@@ -279,7 +255,7 @@ public final class Encoder {
     /**
      * Return the size of the dynamic table. Exposed for testing.
      */
-    int size() {
+    long size() {
         return size;
     }
 
@@ -302,7 +278,7 @@ public final class Encoder {
         if (length() == 0 || name == null || value == null) {
             return null;
         }
-        int h = hash(name);
+        int h = AsciiString.hashCode(name);
         int i = index(h);
         for (HeaderEntry e = headerFields[i]; e != null; e = e.next) {
             // To avoid short circuit behavior a bitwise operator is used instead of a boolean operator.
@@ -321,26 +297,21 @@ public final class Encoder {
         if (length() == 0 || name == null) {
             return -1;
         }
-        int h = hash(name);
+        int h = AsciiString.hashCode(name);
         int i = index(h);
-        int index = -1;
         for (HeaderEntry e = headerFields[i]; e != null; e = e.next) {
             if (e.hash == h && equalsConstantTime(name, e.name) != 0) {
-                index = e.index;
-                break;
+                return getIndex(e.index);
             }
         }
-        return getIndex(index);
+        return -1;
     }
 
     /**
      * Compute the index into the dynamic table given the index in the header entry.
      */
     private int getIndex(int index) {
-        if (index == -1) {
-            return -1;
-        }
-        return index - head.before.index + 1;
+        return index == -1 ? -1 : index - head.before.index + 1;
     }
 
     /**
@@ -362,7 +333,7 @@ public final class Encoder {
             remove();
         }
 
-        int h = hash(name);
+        int h = AsciiString.hashCode(name);
         int i = index(h);
         HeaderEntry old = headerFields[i];
         HeaderEntry e = new HeaderEntry(h, name, value, head.before.index - 1, old);
@@ -411,27 +382,10 @@ public final class Encoder {
     }
 
     /**
-     * Returns the hash code for the given header field name.
-     */
-    private static int hash(CharSequence name) {
-        int h = 0;
-        for (int i = 0; i < name.length(); i++) {
-            h = 31 * h + name.charAt(i);
-        }
-        if (h > 0) {
-            return h;
-        } else if (h == Integer.MIN_VALUE) {
-            return Integer.MAX_VALUE;
-        } else {
-            return -h;
-        }
-    }
-
-    /**
      * Returns the index into the hash table for the hash code h.
      */
-    private static int index(int h) {
-        return h % BUCKET_SIZE;
+    private int index(int h) {
+        return h & hashMask;
     }
 
     /**

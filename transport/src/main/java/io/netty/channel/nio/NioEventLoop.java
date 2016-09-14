@@ -35,6 +35,8 @@ import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.spi.SelectorProvider;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.ConcurrentModificationException;
@@ -82,15 +84,19 @@ public final class NioEventLoop extends SingleThreadEventLoop {
     // - http://bugs.sun.com/view_bug.do?bug_id=6427854
     // - https://github.com/netty/netty/issues/203
     static {
-        String key = "sun.nio.ch.bugLevel";
-        try {
-            String buglevel = SystemPropertyUtil.get(key);
-            if (buglevel == null) {
-                System.setProperty(key, "");
-            }
-        } catch (SecurityException e) {
-            if (logger.isDebugEnabled()) {
-                logger.debug("Unable to get/set System Property: {}", key, e);
+        final String key = "sun.nio.ch.bugLevel";
+        final String buglevel = SystemPropertyUtil.get(key);
+        if (buglevel == null) {
+            try {
+                AccessController.doPrivileged(new PrivilegedAction<Void>() {
+                    @Override
+                    public Void run() {
+                        System.setProperty(key, "");
+                        return null;
+                    }
+                });
+            } catch (final SecurityException e) {
+                logger.debug("Unable to get/set System Property: " + key, e);
             }
         }
 
@@ -155,31 +161,73 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             return selector;
         }
 
-        try {
-            SelectedSelectionKeySet selectedKeySet = new SelectedSelectionKeySet();
+        final SelectedSelectionKeySet selectedKeySet = new SelectedSelectionKeySet();
 
-            Class<?> selectorImplClass =
-                    Class.forName("sun.nio.ch.SelectorImpl", false, PlatformDependent.getSystemClassLoader());
-
-            // Ensure the current selector implementation is what we can instrument.
-            if (!selectorImplClass.isAssignableFrom(selector.getClass())) {
-                return selector;
+        Object maybeSelectorImplClass = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+            @Override
+            public Object run() {
+                try {
+                    return Class.forName(
+                            "sun.nio.ch.SelectorImpl",
+                            false,
+                            PlatformDependent.getSystemClassLoader());
+                } catch (ClassNotFoundException e) {
+                    return e;
+                } catch (SecurityException e) {
+                    return e;
+                }
             }
+        });
 
-            Field selectedKeysField = selectorImplClass.getDeclaredField("selectedKeys");
-            Field publicSelectedKeysField = selectorImplClass.getDeclaredField("publicSelectedKeys");
+        if (!(maybeSelectorImplClass instanceof Class) ||
+                // ensure the current selector implementation is what we can instrument.
+                !((Class<?>) maybeSelectorImplClass).isAssignableFrom(selector.getClass())) {
+            if (maybeSelectorImplClass instanceof Exception) {
+                Exception e = (Exception) maybeSelectorImplClass;
+                logger.trace("failed to instrument a special java.util.Set into: {}", selector, e);
+            }
+            return selector;
+        }
 
-            selectedKeysField.setAccessible(true);
-            publicSelectedKeysField.setAccessible(true);
+        final Class<?> selectorImplClass = (Class<?>) maybeSelectorImplClass;
 
-            selectedKeysField.set(selector, selectedKeySet);
-            publicSelectedKeysField.set(selector, selectedKeySet);
+        Object maybeException = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+            @Override
+            public Object run() {
+                try {
+                    Field selectedKeysField = selectorImplClass.getDeclaredField("selectedKeys");
+                    Field publicSelectedKeysField = selectorImplClass.getDeclaredField("publicSelectedKeys");
 
-            selectedKeys = selectedKeySet;
-            logger.trace("Instrumented an optimized java.util.Set into: {}", selector);
-        } catch (Throwable t) {
+                    selectedKeysField.setAccessible(true);
+                    publicSelectedKeysField.setAccessible(true);
+
+                    selectedKeysField.set(selector, selectedKeySet);
+                    publicSelectedKeysField.set(selector, selectedKeySet);
+                    return null;
+                } catch (NoSuchFieldException e) {
+                    return e;
+                } catch (IllegalAccessException e) {
+                    return e;
+                } catch (RuntimeException e) {
+                    // JDK 9 can throw an inaccessible object exception here; since Netty compiles
+                    // against JDK 7 and this exception was only added in JDK 9, we have to weakly
+                    // check the type
+                    if ("java.lang.reflect.InaccessibleObjectException".equals(e.getClass().getName())) {
+                        return e;
+                    } else {
+                        throw e;
+                    }
+                }
+            }
+        });
+
+        if (maybeException instanceof Exception) {
             selectedKeys = null;
-            logger.trace("Failed to instrument an optimized java.util.Set into: {}", selector, t);
+            Exception e = (Exception) maybeException;
+            logger.trace("failed to instrument a special java.util.Set into: {}", selector, e);
+        } else {
+            selectedKeys = selectedKeySet;
+            logger.trace("instrumented a special java.util.Set into: {}", selector);
         }
 
         return selector;
@@ -565,6 +613,18 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
         try {
             int readyOps = k.readyOps();
+            // We first need to call finishConnect() before try to trigger a read(...) or write(...) as otherwise
+            // the NIO JDK channel implementation may throw a NotYetConnectedException.
+            if ((readyOps & SelectionKey.OP_CONNECT) != 0) {
+                // remove OP_CONNECT as otherwise Selector.select(..) will always return without blocking
+                // See https://github.com/netty/netty/issues/924
+                int ops = k.interestOps();
+                ops &= ~SelectionKey.OP_CONNECT;
+                k.interestOps(ops);
+
+                unsafe.finishConnect();
+            }
+
             // Also check for readOps of 0 to workaround possible JDK bug which may otherwise lead
             // to a spin loop
             if ((readyOps & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0 || readyOps == 0) {
@@ -577,15 +637,6 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             if ((readyOps & SelectionKey.OP_WRITE) != 0) {
                 // Call forceFlush which will also take care of clear the OP_WRITE once there is nothing left to write
                 ch.unsafe().forceFlush();
-            }
-            if ((readyOps & SelectionKey.OP_CONNECT) != 0) {
-                // remove OP_CONNECT as otherwise Selector.select(..) will always return without blocking
-                // See https://github.com/netty/netty/issues/924
-                int ops = k.interestOps();
-                ops &= ~SelectionKey.OP_CONNECT;
-                k.interestOps(ops);
-
-                unsafe.finishConnect();
             }
         } catch (CancelledKeyException ignored) {
             unsafe.close(unsafe.voidPromise());

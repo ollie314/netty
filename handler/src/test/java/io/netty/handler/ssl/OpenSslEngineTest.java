@@ -16,19 +16,19 @@
 package io.netty.handler.ssl;
 
 import io.netty.buffer.UnpooledByteBufAllocator;
+import io.netty.handler.ssl.ApplicationProtocolConfig.Protocol;
+import io.netty.handler.ssl.ApplicationProtocolConfig.SelectedListenerFailureBehavior;
+import io.netty.handler.ssl.ApplicationProtocolConfig.SelectorFailureBehavior;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
 import io.netty.util.internal.ThreadLocalRandom;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import io.netty.handler.ssl.ApplicationProtocolConfig.Protocol;
-import io.netty.handler.ssl.ApplicationProtocolConfig.SelectedListenerFailureBehavior;
-import io.netty.handler.ssl.ApplicationProtocolConfig.SelectorFailureBehavior;
+import java.nio.ByteBuffer;
 
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
-import java.nio.ByteBuffer;
 
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
@@ -79,31 +79,43 @@ public class OpenSslEngineTest extends SSLEngineTest {
     }
     @Test
     public void testWrapHeapBuffersNoWritePendingError() throws Exception {
-        final SslContext clientContext = SslContextBuilder.forClient()
+        clientSslCtx = SslContextBuilder.forClient()
                 .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                .sslProvider(sslProvider())
+                .sslProvider(sslClientProvider())
                 .build();
         SelfSignedCertificate ssc = new SelfSignedCertificate();
-        SslContext serverContext = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .sslProvider(sslProvider())
+        serverSslCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
+                .sslProvider(sslServerProvider())
                 .build();
-        SSLEngine clientEngine = clientContext.newEngine(UnpooledByteBufAllocator.DEFAULT);
-        SSLEngine serverEngine = serverContext.newEngine(UnpooledByteBufAllocator.DEFAULT);
-        handshake(clientEngine, serverEngine);
+        SSLEngine clientEngine = null;
+        SSLEngine serverEngine = null;
+        try {
+            clientEngine = clientSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            serverEngine = serverSslCtx.newEngine(UnpooledByteBufAllocator.DEFAULT);
+            handshake(clientEngine, serverEngine);
 
-        ByteBuffer src = ByteBuffer.allocate(1024 * 10);
-        ThreadLocalRandom.current().nextBytes(src.array());
-        ByteBuffer dst = ByteBuffer.allocate(1);
-        // Try to wrap multiple times so we are more likely to hit the issue.
-        for (int i = 0; i < 100; i++) {
-            src.position(0);
-            dst.position(0);
-            assertSame(SSLEngineResult.Status.BUFFER_OVERFLOW, clientEngine.wrap(src, dst).getStatus());
+            ByteBuffer src = ByteBuffer.allocate(1024 * 10);
+            ThreadLocalRandom.current().nextBytes(src.array());
+            ByteBuffer dst = ByteBuffer.allocate(1);
+            // Try to wrap multiple times so we are more likely to hit the issue.
+            for (int i = 0; i < 100; i++) {
+                src.position(0);
+                dst.position(0);
+                assertSame(SSLEngineResult.Status.BUFFER_OVERFLOW, clientEngine.wrap(src, dst).getStatus());
+            }
+        } finally {
+            cleanupClientSslEngine(clientEngine);
+            cleanupServerSslEngine(serverEngine);
         }
     }
 
     @Override
-    protected SslProvider sslProvider() {
+    protected SslProvider sslClientProvider() {
+        return SslProvider.OPENSSL;
+    }
+
+    @Override
+    protected SslProvider sslServerProvider() {
         return SslProvider.OPENSSL;
     }
 

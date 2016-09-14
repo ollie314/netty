@@ -25,6 +25,10 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.channel.local.LocalAddress;
 import io.netty.channel.local.LocalChannel;
 import io.netty.channel.local.LocalServerChannel;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.oio.OioEventLoopGroup;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.channel.socket.oio.OioSocketChannel;
 import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.ReferenceCounted;
@@ -35,6 +39,7 @@ import io.netty.util.concurrent.EventExecutorGroup;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.ImmediateEventExecutor;
 import io.netty.util.concurrent.Promise;
+import io.netty.util.concurrent.UnorderedThreadPoolEventExecutor;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Test;
@@ -52,6 +57,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 import static org.junit.Assert.*;
 
@@ -885,6 +891,62 @@ public class DefaultChannelPipelineTest {
         }
     }
 
+    @Test(timeout = 3000)
+    public void testAddInListenerNio() throws Throwable {
+        testAddInListener(new NioSocketChannel(), new NioEventLoopGroup(1));
+    }
+
+    @Test(timeout = 3000)
+    public void testAddInListenerOio() throws Throwable {
+        testAddInListener(new OioSocketChannel(), new OioEventLoopGroup(1));
+    }
+
+    @Test(timeout = 3000)
+    public void testAddInListenerLocal() throws Throwable {
+        testAddInListener(new LocalChannel(), new DefaultEventLoopGroup(1));
+    }
+
+    private static void testAddInListener(Channel channel, EventLoopGroup group) throws Throwable {
+        ChannelPipeline pipeline1 = channel.pipeline();
+        try {
+            final Object event = new Object();
+            final Promise<Object> promise = ImmediateEventExecutor.INSTANCE.newPromise();
+            group.register(pipeline1.channel()).addListener(new ChannelFutureListener() {
+                @Override
+                public void operationComplete(ChannelFuture future) throws Exception {
+                    ChannelPipeline pipeline = future.channel().pipeline();
+                    final AtomicBoolean handlerAddedCalled = new AtomicBoolean();
+                    pipeline.addLast(new ChannelInboundHandlerAdapter() {
+                        @Override
+                        public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+                            handlerAddedCalled.set(true);
+                        }
+
+                        @Override
+                        public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+                            promise.setSuccess(event);
+                        }
+
+                        @Override
+                        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                            promise.setFailure(cause);
+                        }
+                    });
+                    if (!handlerAddedCalled.get()) {
+                        promise.setFailure(new AssertionError("handlerAdded(...) should have been called"));
+                        return;
+                    }
+                    // This event must be captured by the added handler.
+                    pipeline.fireUserEventTriggered(event);
+                }
+            });
+            assertSame(event, promise.syncUninterruptibly().getNow());
+        } finally {
+            pipeline1.channel().close().syncUninterruptibly();
+            group.shutdownGracefully();
+        }
+    }
+
     @Test
     public void testNullName() {
         ChannelPipeline pipeline = new LocalChannel().pipeline();
@@ -897,6 +959,75 @@ public class DefaultChannelPipelineTest {
         pipeline.addAfter("test", null, newHandler());
 
         pipeline.addBefore("test", null, newHandler());
+    }
+
+    @Test(timeout = 3000)
+    public void testUnorderedEventExecutor() throws Throwable {
+        ChannelPipeline pipeline1 = new LocalChannel().pipeline();
+        EventExecutorGroup eventExecutors = new UnorderedThreadPoolEventExecutor(2);
+        EventLoopGroup defaultGroup = new DefaultEventLoopGroup(1);
+        try {
+            EventLoop eventLoop1 = defaultGroup.next();
+            eventLoop1.register(pipeline1.channel()).syncUninterruptibly();
+            final CountDownLatch latch = new CountDownLatch(1);
+            pipeline1.addLast(eventExecutors, new ChannelInboundHandlerAdapter() {
+                @Override
+                public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+                    // Just block one of the two threads.
+                    LockSupport.park();
+                }
+
+                @Override
+                public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+                    latch.countDown();
+                }
+            });
+            // Trigger an event, as we use UnorderedEventExecutor userEventTriggered should be called even when
+            // handlerAdded(...) blocks.
+            pipeline1.fireUserEventTriggered("");
+            latch.await();
+        } finally {
+            defaultGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS).syncUninterruptibly();
+            eventExecutors.shutdownGracefully(0, 0, TimeUnit.SECONDS).syncUninterruptibly();
+        }
+    }
+
+    @Test
+    public void testPinExecutor() {
+        EventExecutorGroup group = new DefaultEventExecutorGroup(2);
+        ChannelPipeline pipeline = new LocalChannel().pipeline();
+        ChannelPipeline pipeline2 = new LocalChannel().pipeline();
+
+        pipeline.addLast(group, "h1", new ChannelInboundHandlerAdapter());
+        pipeline.addLast(group, "h2", new ChannelInboundHandlerAdapter());
+        pipeline2.addLast(group, "h3", new ChannelInboundHandlerAdapter());
+
+        EventExecutor executor1 = pipeline.context("h1").executor();
+        EventExecutor executor2 = pipeline.context("h2").executor();
+        assertNotNull(executor1);
+        assertNotNull(executor2);
+        assertSame(executor1, executor2);
+        EventExecutor executor3 = pipeline2.context("h3").executor();
+        assertNotNull(executor3);
+        assertNotSame(executor3, executor2);
+        group.shutdownGracefully(0, 0, TimeUnit.SECONDS);
+    }
+
+    @Test
+    public void testNotPinExecutor() {
+        EventExecutorGroup group = new DefaultEventExecutorGroup(2);
+        ChannelPipeline pipeline = new LocalChannel().pipeline();
+        pipeline.channel().config().setOption(ChannelOption.SINGLE_EVENTEXECUTOR_PER_GROUP, false);
+
+        pipeline.addLast(group, "h1", new ChannelInboundHandlerAdapter());
+        pipeline.addLast(group, "h2", new ChannelInboundHandlerAdapter());
+
+        EventExecutor executor1 = pipeline.context("h1").executor();
+        EventExecutor executor2 = pipeline.context("h2").executor();
+        assertNotNull(executor1);
+        assertNotNull(executor2);
+        assertNotSame(executor1, executor2);
+        group.shutdownGracefully(0, 0, TimeUnit.SECONDS);
     }
 
     private static final class TestTask implements Runnable {

@@ -66,6 +66,7 @@ public class DefaultChannelPipeline implements ChannelPipeline {
 
     private Map<EventExecutorGroup, EventExecutor> childExecutors;
     private MessageSizeEstimator.Handle estimatorHandle;
+    private boolean firstRegistration = true;
 
     /**
      * This is the head of a linked list that is processed by {@link #callHandlerAddedForAllHandlers()} and so process
@@ -114,6 +115,10 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         if (group == null) {
             return null;
         }
+        Boolean pinEventExecutor = channel.config().getOption(ChannelOption.SINGLE_EVENTEXECUTOR_PER_GROUP);
+        if (pinEventExecutor != null && !pinEventExecutor) {
+            return group.next();
+        }
         Map<EventExecutorGroup, EventExecutor> childExecutors = this.childExecutors;
         if (childExecutors == null) {
             // Use size of 4 as most people only use one extra EventExecutor.
@@ -128,7 +133,6 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         }
         return childExecutor;
     }
-
     @Override
     public final Channel channel() {
         return channel;
@@ -154,12 +158,14 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             // In this case we add the context to the pipeline and add a task that will call
             // ChannelHandler.handlerAdded(...) once the channel is registered.
             if (!registered) {
+                newCtx.setAddPending();
                 callHandlerCallbackLater(newCtx, true);
                 return this;
             }
 
             EventExecutor executor = newCtx.executor();
             if (!executor.inEventLoop()) {
+                newCtx.setAddPending();
                 executor.execute(new Runnable() {
                     @Override
                     public void run() {
@@ -200,12 +206,14 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             // In this case we add the context to the pipeline and add a task that will call
             // ChannelHandler.handlerAdded(...) once the channel is registered.
             if (!registered) {
+                newCtx.setAddPending();
                 callHandlerCallbackLater(newCtx, true);
                 return this;
             }
 
             EventExecutor executor = newCtx.executor();
             if (!executor.inEventLoop()) {
+                newCtx.setAddPending();
                 executor.execute(new Runnable() {
                     @Override
                     public void run() {
@@ -250,12 +258,14 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             // In this case we add the context to the pipeline and add a task that will call
             // ChannelHandler.handlerAdded(...) once the channel is registered.
             if (!registered) {
+                newCtx.setAddPending();
                 callHandlerCallbackLater(newCtx, true);
                 return this;
             }
 
             EventExecutor executor = newCtx.executor();
             if (!executor.inEventLoop()) {
+                newCtx.setAddPending();
                 executor.execute(new Runnable() {
                     @Override
                     public void run() {
@@ -308,11 +318,13 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             // In this case we remove the context from the pipeline and add a task that will call
             // ChannelHandler.handlerRemoved(...) once the channel is registered.
             if (!registered) {
+                newCtx.setAddPending();
                 callHandlerCallbackLater(newCtx, true);
                 return this;
             }
             EventExecutor executor = newCtx.executor();
             if (!executor.inEventLoop()) {
+                newCtx.setAddPending();
                 executor.execute(new Runnable() {
                     @Override
                     public void run() {
@@ -583,7 +595,7 @@ public class DefaultChannelPipeline implements ChannelPipeline {
     private void callHandlerAdded0(final AbstractChannelHandlerContext ctx) {
         try {
             ctx.handler().handlerAdded(ctx);
-            ctx.setAdded();
+            ctx.setAddComplete();
         } catch (Throwable t) {
             boolean removed = false;
             try {
@@ -623,6 +635,16 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         } catch (Throwable t) {
             fireExceptionCaught(new ChannelPipelineException(
                     ctx.handler().getClass().getName() + ".handlerRemoved() has thrown an exception.", t));
+        }
+    }
+
+    final void invokeHandlerAddedIfNeeded() {
+        assert channel.eventLoop().inEventLoop();
+        if (firstRegistration) {
+            firstRegistration = false;
+            // We are now registered to the EventLoop. It's time to call the callbacks for the ChannelHandlers,
+            // that were added before the registration was done.
+            callHandlerAddedForAllHandlers();
         }
     }
 
@@ -1153,7 +1175,7 @@ public class DefaultChannelPipeline implements ChannelPipeline {
 
         TailContext(DefaultChannelPipeline pipeline) {
             super(pipeline, null, TAIL_NAME, true, false);
-            setAdded();
+            setAddComplete();
         }
 
         @Override
@@ -1207,12 +1229,11 @@ public class DefaultChannelPipeline implements ChannelPipeline {
             implements ChannelOutboundHandler, ChannelInboundHandler {
 
         private final Unsafe unsafe;
-        private boolean firstRegistration = true;
 
         HeadContext(DefaultChannelPipeline pipeline) {
             super(pipeline, null, HEAD_NAME, false, true);
             unsafe = pipeline.channel().unsafe();
-            setAdded();
+            setAddComplete();
         }
 
         @Override
@@ -1282,13 +1303,7 @@ public class DefaultChannelPipeline implements ChannelPipeline {
 
         @Override
         public void channelRegistered(ChannelHandlerContext ctx) throws Exception {
-            if (firstRegistration) {
-                firstRegistration = false;
-                // We are now registered to the EventLoop. It's time to call the callbacks for the ChannelHandlers,
-                // that were added before the registration was done.
-                callHandlerAddedForAllHandlers();
-            }
-
+            invokeHandlerAddedIfNeeded();
             ctx.fireChannelRegistered();
         }
 

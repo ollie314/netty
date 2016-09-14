@@ -127,6 +127,30 @@ public class SlicedByteBufTest extends AbstractByteBufTest {
     }
 
     @Test
+    @Override
+    public void testForEachByteDesc2() {
+        // Ignore for SlicedByteBuf
+    }
+
+    @Test
+    @Override
+    public void testForEachByte2() {
+        // Ignore for SlicedByteBuf
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    @Override
+    public void testDuplicateCapacityChange() {
+        super.testDuplicateCapacityChange();
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    @Override
+    public void testRetainedDuplicateCapacityChange() {
+        super.testRetainedDuplicateCapacityChange();
+    }
+
+    @Test
     public void testReaderIndexAndMarks() {
         ByteBuf wrapped = Unpooled.buffer(16);
         try {
@@ -134,7 +158,7 @@ public class SlicedByteBufTest extends AbstractByteBufTest {
             wrapped.readerIndex(2);
             wrapped.markWriterIndex();
             wrapped.markReaderIndex();
-            ByteBuf slice = new SlicedByteBuf(wrapped, 4, 4);
+            ByteBuf slice = wrapped.slice(4, 4);
             assertEquals(0, slice.readerIndex());
             assertEquals(4, slice.writerIndex());
 

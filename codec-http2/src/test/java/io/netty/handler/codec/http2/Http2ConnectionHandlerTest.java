@@ -27,6 +27,7 @@ import io.netty.channel.DefaultChannelPromise;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.GenericFutureListener;
+import io.netty.util.concurrent.ImmediateEventExecutor;
 import io.netty.util.concurrent.Promise;
 import org.junit.After;
 import org.junit.Before;
@@ -49,7 +50,6 @@ import static io.netty.handler.codec.http2.Http2Stream.State.IDLE;
 import static io.netty.util.CharsetUtil.UTF_8;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyBoolean;
@@ -124,7 +124,7 @@ public class Http2ConnectionHandlerTest {
     public void setup() throws Exception {
         MockitoAnnotations.initMocks(this);
 
-        promise = new DefaultChannelPromise(channel);
+        promise = new DefaultChannelPromise(channel, ImmediateEventExecutor.INSTANCE);
 
         Throwable fakeException = new RuntimeException("Fake exception");
         when(encoder.connection()).thenReturn(connection);
@@ -312,13 +312,10 @@ public class Http2ConnectionHandlerTest {
     @Test
     public void writeRstOnNonExistantStreamShouldSucceed() throws Exception {
         handler = newHandler();
+        when(frameWriter.writeRstStream(eq(ctx), eq(NON_EXISTANT_STREAM_ID),
+                                        eq(STREAM_CLOSED.code()), eq(promise))).thenReturn(future);
         handler.resetStream(ctx, NON_EXISTANT_STREAM_ID, STREAM_CLOSED.code(), promise);
-        verify(frameWriter, never())
-            .writeRstStream(any(ChannelHandlerContext.class), anyInt(), anyLong(),
-                    any(ChannelPromise.class));
-        assertTrue(promise.isDone());
-        assertTrue(promise.isSuccess());
-        assertNull(promise.cause());
+        verify(frameWriter).writeRstStream(eq(ctx), eq(NON_EXISTANT_STREAM_ID), eq(STREAM_CLOSED.code()), eq(promise));
     }
 
     @Test
@@ -421,21 +418,25 @@ public class Http2ConnectionHandlerTest {
     public void cannotSendGoAwayFrameWithIncreasingLastStreamIds() throws Exception {
         handler = newHandler();
         ByteBuf data = dummyData();
-        long errorCode = Http2Error.INTERNAL_ERROR.code();
+        try {
+            long errorCode = Http2Error.INTERNAL_ERROR.code();
 
-        handler.goAway(ctx, STREAM_ID, errorCode, data.retain(), promise);
-        verify(connection).goAwaySent(eq(STREAM_ID), eq(errorCode), eq(data));
-        verify(frameWriter).writeGoAway(eq(ctx), eq(STREAM_ID), eq(errorCode), eq(data), eq(promise));
-        // The frameWriter is only mocked, so it should not have interacted with the promise.
-        assertFalse(promise.isDone());
+            handler.goAway(ctx, STREAM_ID, errorCode, data.retain(), promise);
+            verify(connection).goAwaySent(eq(STREAM_ID), eq(errorCode), eq(data));
+            verify(frameWriter).writeGoAway(eq(ctx), eq(STREAM_ID), eq(errorCode), eq(data), eq(promise));
+            // The frameWriter is only mocked, so it should not have interacted with the promise.
+            assertFalse(promise.isDone());
 
-        when(connection.goAwaySent()).thenReturn(true);
-        when(remote.lastStreamKnownByPeer()).thenReturn(STREAM_ID);
-        handler.goAway(ctx, STREAM_ID + 2, errorCode, data, promise);
-        assertTrue(promise.isDone());
-        assertFalse(promise.isSuccess());
-        assertEquals(0, data.refCnt());
-        verifyNoMoreInteractions(frameWriter);
+            when(connection.goAwaySent()).thenReturn(true);
+            when(remote.lastStreamKnownByPeer()).thenReturn(STREAM_ID);
+            handler.goAway(ctx, STREAM_ID + 2, errorCode, data, promise);
+            assertTrue(promise.isDone());
+            assertFalse(promise.isSuccess());
+            assertEquals(1, data.refCnt());
+            verifyNoMoreInteractions(frameWriter);
+        } finally {
+            data.release();
+        }
     }
 
     @Test

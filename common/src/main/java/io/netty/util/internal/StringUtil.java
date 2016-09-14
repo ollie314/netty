@@ -17,10 +17,9 @@ package io.netty.util.internal;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Formatter;
 import java.util.List;
 
-import static io.netty.util.internal.ObjectUtil.checkNotNull;
+import static io.netty.util.internal.ObjectUtil.*;
 
 /**
  * String utility class.
@@ -28,7 +27,7 @@ import static io.netty.util.internal.ObjectUtil.checkNotNull;
 public final class StringUtil {
 
     public static final String EMPTY_STRING = "";
-    public static final String NEWLINE;
+    public static final String NEWLINE = System.getProperty("line.separator");
 
     public static final char DOUBLE_QUOTE = '\"';
     public static final char COMMA = ',';
@@ -47,130 +46,26 @@ public final class StringUtil {
     private static final char PACKAGE_SEPARATOR_CHAR = '.';
 
     static {
-        // Determine the newline character of the current platform.
-        String newLine;
-
-        Formatter formatter = new Formatter();
-        try {
-            newLine = formatter.format("%n").toString();
-        } catch (Exception e) {
-            // Should not reach here, but just in case.
-            newLine = "\n";
-        } finally {
-            formatter.close();
-        }
-
-        NEWLINE = newLine;
-
         // Generate the lookup table that converts a byte into a 2-digit hexadecimal integer.
         int i;
         for (i = 0; i < 10; i ++) {
-            StringBuilder buf = new StringBuilder(2);
-            buf.append('0');
-            buf.append(i);
-            BYTE2HEX_PAD[i] = buf.toString();
+            BYTE2HEX_PAD[i] = "0" + i;
             BYTE2HEX_NOPAD[i] = String.valueOf(i);
         }
         for (; i < 16; i ++) {
-            StringBuilder buf = new StringBuilder(2);
             char c = (char) ('a' + i - 10);
-            buf.append('0');
-            buf.append(c);
-            BYTE2HEX_PAD[i] = buf.toString();
+            BYTE2HEX_PAD[i] = "0" + c;
             BYTE2HEX_NOPAD[i] = String.valueOf(c);
         }
         for (; i < BYTE2HEX_PAD.length; i ++) {
-            StringBuilder buf = new StringBuilder(2);
-            buf.append(Integer.toHexString(i));
-            String str = buf.toString();
+            String str = Integer.toHexString(i);
             BYTE2HEX_PAD[i] = str;
             BYTE2HEX_NOPAD[i] = str;
         }
     }
 
-    /**
-     * Splits the specified {@link String} with the specified delimiter.  This operation is a simplified and optimized
-     * version of {@link String#split(String)}.
-     */
-    public static String[] split(String value, char delim) {
-        final int end = value.length();
-        final List<String> res = InternalThreadLocalMap.get().arrayList();
-
-        int start = 0;
-        for (int i = 0; i < end; i ++) {
-            if (value.charAt(i) == delim) {
-                if (start == i) {
-                    res.add(EMPTY_STRING);
-                } else {
-                    res.add(value.substring(start, i));
-                }
-                start = i + 1;
-            }
-        }
-
-        if (start == 0) { // If no delimiter was found in the value
-            res.add(value);
-        } else {
-            if (start != end) {
-                // Add the last element if it's not empty.
-                res.add(value.substring(start, end));
-            } else {
-                // Truncate trailing empty elements.
-                for (int i = res.size() - 1; i >= 0; i --) {
-                    if (res.get(i).isEmpty()) {
-                        res.remove(i);
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-
-        return res.toArray(new String[res.size()]);
-    }
-
-    /**
-     * Splits the specified {@link String} with the specified delimiter in maxParts maximum parts.
-     * This operation is a simplified and optimized
-     * version of {@link String#split(String, int)}.
-     */
-    public static String[] split(String value, char delim, int maxParts) {
-        final int end = value.length();
-        final List<String> res = InternalThreadLocalMap.get().arrayList();
-
-        int start = 0;
-        int cpt = 1;
-        for (int i = 0; i < end && cpt < maxParts; i ++) {
-            if (value.charAt(i) == delim) {
-                if (start == i) {
-                    res.add(EMPTY_STRING);
-                } else {
-                    res.add(value.substring(start, i));
-                }
-                start = i + 1;
-                cpt++;
-            }
-        }
-
-        if (start == 0) { // If no delimiter was found in the value
-            res.add(value);
-        } else {
-            if (start != end) {
-                // Add the last element if it's not empty.
-                res.add(value.substring(start, end));
-            } else {
-                // Truncate trailing empty elements.
-                for (int i = res.size() - 1; i >= 0; i --) {
-                    if (res.get(i).isEmpty()) {
-                        res.remove(i);
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-
-        return res.toArray(new String[res.size()]);
+    private StringUtil() {
+        // Unused.
     }
 
     /**
@@ -548,7 +443,15 @@ public final class StringUtil {
         return c == DOUBLE_QUOTE;
     }
 
-    private StringUtil() {
-        // Unused.
+    /**
+     * Determine if the string {@code s} ends with the char {@code c}.
+     *
+     * @param s the string to test
+     * @param c the tested char
+     * @return true if {@code s} ends with the char {@code c}
+     */
+    public static boolean endsWith(CharSequence s, char c) {
+        int len = s.length();
+        return len > 0 && s.charAt(len - 1) == c;
     }
 }

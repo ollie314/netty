@@ -26,7 +26,7 @@
   <groupId>io.netty</groupId>
   <artifactId>netty-parent</artifactId>
   <packaging>pom</packaging>
-  <version>4.1.2.Final-SNAPSHOT</version>
+  <version>4.1.6.Final-SNAPSHOT</version>
 
   <name>Netty</name>
   <url>http://netty.io/</url>
@@ -160,7 +160,7 @@
                         Release process must be performed on linux-x86_64.
                       </regexMessage>
                       <property>os.detected.classifier</property>
-                      <regex>^linux-x86_64$</regex>
+                      <regex>^linux-x86_64-fedora$</regex>
                     </requireProperty>
                     <requireFilesContent>
                       <message>
@@ -224,12 +224,12 @@
     <!-- Fedora-"like" systems. This is currently only used for the netty-tcnative dependency -->
     <os.detection.classifierWithLikes>fedora</os.detection.classifierWithLikes>
     <tcnative.artifactId>netty-tcnative</tcnative.artifactId>
-    <tcnative.version>1.1.33.Fork18</tcnative.version>
+    <tcnative.version>1.1.33.Fork22</tcnative.version>
     <tcnative.classifier>${os.detected.classifier}</tcnative.classifier>
     <epoll.classifier>${os.detected.name}-${os.detected.arch}</epoll.classifier>
     <logging.config>${project.basedir}/../common/src/test/resources/logback-test.xml</logging.config>
     <logging.logLevel>debug</logging.logLevel>
-    <log4j2.version>2.6.1</log4j2.version>
+    <log4j2.version>2.6.2</log4j2.version>
   </properties>
 
   <modules>
@@ -599,13 +599,6 @@
       <artifactId>logback-classic</artifactId>
       <scope>test</scope>
     </dependency>
-
-    <!-- Provided dependency for tests inside IDEs -->
-    <dependency>
-      <groupId>org.jctools</groupId>
-      <artifactId>jctools-core</artifactId>
-      <scope>provided</scope>
-    </dependency>
   </dependencies>
 
   <build>
@@ -703,9 +696,11 @@
 
             <ignore>java.util.zip.Deflater</ignore>
 
-            <!-- Used for NIO UDP multicast -->
+            <!-- Used for NIO -->
             <ignore>java.nio.channels.DatagramChannel</ignore>
             <ignore>java.nio.channels.MembershipKey</ignore>
+            <ignore>java.nio.channels.ServerSocketChannel</ignore>
+            <ignore>java.nio.channels.SocketChannel</ignore>
             <ignore>java.net.StandardProtocolFamily</ignore>
             <ignore>java.nio.channels.spi.SelectorProvider</ignore>
 
@@ -730,6 +725,10 @@
             <ignore>java.security.cert.CertificateRevokedException</ignore>
 
             <ignore>java.util.concurrent.ConcurrentLinkedDeque</ignore>
+
+            <!-- Compression -->
+            <ignore>java.util.zip.CRC32</ignore>
+            <ignore>java.util.zip.Adler32</ignore>
           </ignores>
         </configuration>
         <executions>

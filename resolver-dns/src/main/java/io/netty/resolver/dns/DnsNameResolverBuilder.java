@@ -26,7 +26,6 @@ import io.netty.resolver.HostsFileEntriesResolver;
 import io.netty.util.internal.InternalThreadLocalMap;
 import io.netty.util.internal.UnstableApi;
 
-import java.net.InetSocketAddress;
 import java.util.List;
 
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
@@ -39,7 +38,6 @@ public final class DnsNameResolverBuilder {
 
     private final EventLoop eventLoop;
     private ChannelFactory<? extends DatagramChannel> channelFactory;
-    private InetSocketAddress localAddress = DnsNameResolver.ANY_LOCAL_ADDR;
     private DnsServerAddresses nameServerAddresses = DnsServerAddresses.defaultAddresses();
     private DnsCache resolveCache;
     private Integer minTtl;
@@ -53,6 +51,8 @@ public final class DnsNameResolverBuilder {
     private int maxPayloadSize = 4096;
     private boolean optResourceEnabled = true;
     private HostsFileEntriesResolver hostsFileEntriesResolver = HostsFileEntriesResolver.DEFAULT;
+    private String[] searchDomains = DnsNameResolver.DEFAULT_SEACH_DOMAINS;
+    private int ndots = 1;
 
     /**
      * Creates a new builder.
@@ -84,17 +84,6 @@ public final class DnsNameResolverBuilder {
      */
     public DnsNameResolverBuilder channelType(Class<? extends DatagramChannel> channelType) {
         return channelFactory(new ReflectiveChannelFactory<DatagramChannel>(channelType));
-    }
-
-    /**
-     * Sets the local address of the {@link DatagramChannel}
-     *
-     * @param localAddress the local address
-     * @return {@code this}
-     */
-    public DnsNameResolverBuilder localAddress(InetSocketAddress localAddress) {
-        this.localAddress = localAddress;
-        return this;
     }
 
     /**
@@ -302,6 +291,47 @@ public final class DnsNameResolverBuilder {
     }
 
     /**
+     * Set the list of search domains of the resolver.
+     *
+     * @param searchDomains the search domains
+     * @return {@code this}
+     */
+    public DnsNameResolverBuilder searchDomains(Iterable<String> searchDomains) {
+        checkNotNull(searchDomains, "searchDomains");
+
+        final List<String> list =
+            InternalThreadLocalMap.get().arrayList(4);
+
+        for (String f : searchDomains) {
+            if (f == null) {
+                break;
+            }
+
+            // Avoid duplicate entries.
+            if (list.contains(f)) {
+                continue;
+            }
+
+            list.add(f);
+        }
+
+        this.searchDomains = list.toArray(new String[list.size()]);
+        return this;
+    }
+
+  /**
+   * Set the number of dots which must appear in a name before an initial absolute query is made.
+   * The default value is {@code 1}.
+   *
+   * @param ndots the ndots value
+   * @return {@code this}
+   */
+    public DnsNameResolverBuilder ndots(int ndots) {
+        this.ndots = ndots;
+        return this;
+    }
+
+    /**
      * Returns a new {@link DnsNameResolver} instance.
      *
      * @return a {@link DnsNameResolver}
@@ -318,7 +348,6 @@ public final class DnsNameResolverBuilder {
         return new DnsNameResolver(
                 eventLoop,
                 channelFactory,
-                localAddress,
                 nameServerAddresses,
                 cache,
                 queryTimeoutMillis,
@@ -328,6 +357,8 @@ public final class DnsNameResolverBuilder {
                 traceEnabled,
                 maxPayloadSize,
                 optResourceEnabled,
-                hostsFileEntriesResolver);
+                hostsFileEntriesResolver,
+                searchDomains,
+                ndots);
     }
 }

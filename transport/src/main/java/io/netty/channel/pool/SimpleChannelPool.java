@@ -149,16 +149,20 @@ public class SimpleChannelPool implements ChannelPool {
                 });
             }
         } catch (Throwable cause) {
-            promise.setFailure(cause);
+            promise.tryFailure(cause);
         }
         return promise;
     }
 
-    private static void notifyConnect(ChannelFuture future, Promise<Channel> promise) {
+    private void notifyConnect(ChannelFuture future, Promise<Channel> promise) {
         if (future.isSuccess()) {
-            promise.setSuccess(future.channel());
+            Channel channel = future.channel();
+            if (!promise.trySuccess(channel)) {
+                // Promise was completed in the meantime (like cancelled), just release the channel again
+                release(channel);
+            }
         } else {
-            promise.setFailure(future.cause());
+            promise.tryFailure(future.cause());
         }
     }
 
@@ -306,7 +310,7 @@ public class SimpleChannelPool implements ChannelPool {
 
     private static void closeAndFail(Channel channel, Throwable cause, Promise<?> promise) {
         closeChannel(channel);
-        promise.setFailure(cause);
+        promise.tryFailure(cause);
     }
 
     /**

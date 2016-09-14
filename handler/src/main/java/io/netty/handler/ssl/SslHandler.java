@@ -75,12 +75,7 @@ import static io.netty.handler.ssl.SslUtils.getEncryptedPacketLength;
  *
  * <h3>Beginning the handshake</h3>
  * <p>
- * You must make sure not to write a message while the handshake is in progress unless you are
- * renegotiating.  You will be notified by the {@link Future} which is
- * returned by the {@link #handshakeFuture()} method when the handshake
- * process succeeds or fails.
- * <p>
- * Beside using the handshake {@link ChannelFuture} to get notified about the completation of the handshake it's
+ * Beside using the handshake {@link ChannelFuture} to get notified about the completion of the handshake it's
  * also possible to detect it by implement the
  * {@link ChannelInboundHandler#userEventTriggered(ChannelHandlerContext, Object)}
  * method and check for a {@link SslHandshakeCompletionEvent}.
@@ -383,7 +378,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
     /**
      * See {@link #close()}
      */
-    public ChannelFuture close(final ChannelPromise future) {
+    public ChannelFuture close(final ChannelPromise promise) {
         final ChannelHandlerContext ctx = this.ctx;
         ctx.executor().execute(new Runnable() {
             @Override
@@ -391,17 +386,16 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
                 outboundClosed = true;
                 engine.closeOutbound();
                 try {
-                    write(ctx, Unpooled.EMPTY_BUFFER, future);
-                    flush(ctx);
+                    flush(ctx, promise);
                 } catch (Exception e) {
-                    if (!future.tryFailure(e)) {
+                    if (!promise.tryFailure(e)) {
                         logger.warn("{} flush() raised a masked exception.", ctx.channel(), e);
                     }
                 }
             }
         });
 
-        return future;
+        return promise;
     }
 
     /**
@@ -421,9 +415,8 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
             // Check if queue is not empty first because create a new ChannelException is expensive
             pendingUnencryptedWrites.removeAndFailAll(new ChannelException("Pending write on removal of SslHandler"));
         }
-        if (engine instanceof OpenSslEngine) {
-            // Call shutdown so we ensure all the native memory is released asap
-            ((OpenSslEngine) engine).shutdown();
+        if (engine instanceof ReferenceCountedOpenSslEngine) {
+            ((ReferenceCountedOpenSslEngine) engine).release();
         }
     }
 
@@ -495,6 +488,11 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
         }
         try {
             wrap(ctx, false);
+        } catch (Throwable cause) {
+            // Fail pending writes.
+            pendingUnencryptedWrites.removeAndFailAll(cause);
+
+            PlatformDependent.throwException(cause);
         } finally {
             // We may have written some parts of data before an exception was thrown so ensure we always flush.
             // See https://github.com/netty/netty/issues/3900#issuecomment-172481830
@@ -520,11 +518,6 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
                 }
 
                 SSLEngineResult result = wrap(alloc, engine, buf, out);
-                if (!buf.isReadable()) {
-                    promise = pendingUnencryptedWrites.remove();
-                } else {
-                    promise = null;
-                }
 
                 if (result.getStatus() == Status.CLOSED) {
                     // SSLEngine has been closed already.
@@ -532,6 +525,12 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
                     pendingUnencryptedWrites.removeAndFailAll(SSLENGINE_CLOSED);
                     return;
                 } else {
+                    if (!buf.isReadable()) {
+                        promise = pendingUnencryptedWrites.remove();
+                    } else {
+                        promise = null;
+                    }
+
                     switch (result.getHandshakeStatus()) {
                         case NEED_TASK:
                             runDelegatedTasks();
@@ -883,8 +882,6 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
         }
 
         if (totalLength > 0) {
-            boolean decoded = false;
-
             // The buffer contains one or more full SSL records.
             // Slice out the whole packet so unwrap will only be called with complete packets.
             // Also directly reset the packetLength. This is needed as unwrap(..) may trigger
@@ -897,13 +894,8 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
             // See https://github.com/netty/netty/issues/1534
 
             in.skipBytes(totalLength);
-            decoded = unwrap(ctx, in, startOffset, totalLength);
 
-            if (!firedChannelRead) {
-                // Check first if firedChannelRead is not set yet as it may have been set in a
-                // previous decode(...) call.
-                firedChannelRead = decoded;
-            }
+            firedChannelRead = unwrap(ctx, in, startOffset, totalLength) || firedChannelRead;
         }
 
         if (nonSslRecord) {
@@ -1251,10 +1243,17 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
         outboundClosed = true;
         engine.closeOutbound();
 
-        ChannelPromise closeNotifyFuture = ctx.newPromise();
-        write(ctx, Unpooled.EMPTY_BUFFER, closeNotifyFuture);
+        ChannelPromise closeNotifyPromise = ctx.newPromise();
+        try {
+            flush(ctx, closeNotifyPromise);
+        } finally {
+            safeClose(ctx, closeNotifyPromise, promise);
+        }
+    }
+
+    private void flush(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
+        pendingUnencryptedWrites.add(Unpooled.EMPTY_BUFFER, promise);
         flush(ctx);
-        safeClose(ctx, closeNotifyFuture, promise);
     }
 
     @Override
@@ -1407,20 +1406,20 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
         }
 
         final ScheduledFuture<?> timeoutFuture;
-        if (closeNotifyTimeoutMillis > 0) {
-            // Force-close the connection if close_notify is not fully sent in time.
-            timeoutFuture = ctx.executor().schedule(new Runnable() {
-                @Override
-                public void run() {
-                    logger.warn("{} Last write attempt timed out; force-closing the connection.", ctx.channel());
+        if (!flushFuture.isDone()) {
+            if (closeNotifyTimeoutMillis > 0) {
+                // Force-close the connection if close_notify is not fully sent in time.
+                timeoutFuture = ctx.executor().schedule(new Runnable() {
+                    @Override
+                    public void run() {
+                        logger.warn("{} Last write attempt timed out; force-closing the connection.", ctx.channel());
 
-                    // We notify the promise in the TryNotifyListener as there is a "race" where the close(...) call
-                    // by the timeoutFuture and the close call in the flushFuture listener will be called. Because of
-                    // this we need to use trySuccess() and tryFailure(...) as otherwise we can cause an
-                    // IllegalStateException.
-                    ctx.close(ctx.newPromise()).addListener(new ChannelPromiseNotifier(promise));
-                }
-            }, closeNotifyTimeoutMillis, TimeUnit.MILLISECONDS);
+                        addCloseListener(ctx.close(ctx.newPromise()), promise);
+                    }
+                }, closeNotifyTimeoutMillis, TimeUnit.MILLISECONDS);
+            } else {
+                timeoutFuture = null;
+            }
         } else {
             timeoutFuture = null;
         }
@@ -1435,14 +1434,19 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
                 }
                 // Trigger the close in all cases to make sure the promise is notified
                 // See https://github.com/netty/netty/issues/2358
-                //
-                // We notify the promise in the ChannelPromiseNotifier as there is a "race" where the close(...) call
-                // by the timeoutFuture and the close call in the flushFuture listener will be called. Because of
-                // this we need to use trySuccess() and tryFailure(...) as otherwise we can cause an
-                // IllegalStateException.
-                ctx.close(ctx.newPromise()).addListener(new ChannelPromiseNotifier(promise));
+                addCloseListener(ctx.close(ctx.newPromise()), promise);
             }
         });
+    }
+
+    private static void addCloseListener(ChannelFuture future, ChannelPromise promise) {
+        // We notify the promise in the ChannelPromiseNotifier as there is a "race" where the close(...) call
+        // by the timeoutFuture and the close call in the flushFuture listener will be called. Because of
+        // this we need to use trySuccess() and tryFailure(...) as otherwise we can cause an
+        // IllegalStateException.
+        // Also we not want to log if the notification happens as this is expected in some cases.
+        // See https://github.com/netty/netty/issues/5598
+        future.addListener(new ChannelPromiseNotifier(false, promise));
     }
 
     /**

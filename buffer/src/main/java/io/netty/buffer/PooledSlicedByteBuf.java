@@ -28,9 +28,9 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
 
-import static io.netty.util.internal.MathUtil.isOutOfBounds;
+import static io.netty.buffer.AbstractUnpooledSlicedByteBuf.checkSliceOutOfBounds;
 
-final class PooledSlicedByteBuf extends AbstractPooledDerivedByteBuf<PooledSlicedByteBuf> {
+final class PooledSlicedByteBuf extends AbstractPooledDerivedByteBuf {
 
     private static final Recycler<PooledSlicedByteBuf> RECYCLER = new Recycler<PooledSlicedByteBuf>() {
         @Override
@@ -39,20 +39,23 @@ final class PooledSlicedByteBuf extends AbstractPooledDerivedByteBuf<PooledSlice
         }
     };
 
-    static PooledSlicedByteBuf newInstance(AbstractByteBuf buffer, int index, int length, int adjustment) {
-        if (isOutOfBounds(index, length, buffer.capacity())) {
-            throw new IndexOutOfBoundsException(buffer + ".slice(" + index + ", " + length + ')');
-        }
+    static PooledSlicedByteBuf newInstance(AbstractByteBuf unwrapped, ByteBuf wrapped,
+                                           int index, int length) {
+        checkSliceOutOfBounds(index, length, unwrapped);
+        return newInstance0(unwrapped, wrapped, index, length);
+    }
 
+    private static PooledSlicedByteBuf newInstance0(AbstractByteBuf unwrapped, ByteBuf wrapped,
+                                                    int adjustment, int length) {
         final PooledSlicedByteBuf slice = RECYCLER.get();
-        slice.init(buffer, 0, length, length);
+        slice.init(unwrapped, wrapped, 0, length, length);
         slice.discardMarks();
         slice.adjustment = adjustment;
 
         return slice;
     }
 
-    private int adjustment;
+    int adjustment;
 
     private PooledSlicedByteBuf(Handle<PooledSlicedByteBuf> handle) {
         super(handle);
@@ -65,7 +68,7 @@ final class PooledSlicedByteBuf extends AbstractPooledDerivedByteBuf<PooledSlice
 
     @Override
     public ByteBuf capacity(int newCapacity) {
-        return reject();
+        throw new UnsupportedOperationException("sliced buffer");
     }
 
     @Override
@@ -94,6 +97,34 @@ final class PooledSlicedByteBuf extends AbstractPooledDerivedByteBuf<PooledSlice
     public ByteBuf copy(int index, int length) {
         checkIndex0(index, length);
         return unwrap().copy(idx(index), length);
+    }
+
+    @Override
+    public ByteBuf slice(int index, int length) {
+        checkIndex0(index, length);
+        return unwrap().slice(idx(index), length);
+    }
+
+    @Override
+    public ByteBuf retainedSlice(int index, int length) {
+        checkIndex0(index, length);
+        return PooledSlicedByteBuf.newInstance0(unwrap(), this, idx(index), length);
+    }
+
+    @Override
+    public ByteBuf duplicate() {
+        // Capacity is not allowed to change for a sliced ByteBuf, so length == capacity()
+        final ByteBuf duplicate = unwrap().slice(adjustment, capacity());
+        duplicate.setIndex(readerIndex(), writerIndex());
+        return duplicate;
+    }
+
+    @Override
+    public ByteBuf retainedDuplicate() {
+        // Capacity is not allowed to change for a sliced ByteBuf, so length == capacity()
+        final ByteBuf duplicate = retainedSlice(0, capacity());
+        duplicate.setIndex(readerIndex(), writerIndex());
+        return duplicate;
     }
 
     @Override
@@ -410,9 +441,5 @@ final class PooledSlicedByteBuf extends AbstractPooledDerivedByteBuf<PooledSlice
 
     private int idx(int index) {
         return index + adjustment;
-    }
-
-    private static ByteBuf reject() {
-        throw new UnsupportedOperationException("sliced buffer");
     }
 }

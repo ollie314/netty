@@ -21,6 +21,7 @@ import sun.misc.Unsafe;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
@@ -41,13 +42,12 @@ final class PlatformDependent0 {
     static final Unsafe UNSAFE;
     private static final long ADDRESS_FIELD_OFFSET;
     private static final long BYTE_ARRAY_BASE_OFFSET;
-    private static final long CHAR_ARRAY_BASE_OFFSET;
-    private static final long CHAR_ARRAY_INDEX_SCALE;
-    private static final long STRING_CHAR_VALUE_FIELD_OFFSET;
-    private static final long STRING_BYTE_VALUE_FIELD_OFFSET;
     private static final Constructor<?> DIRECT_BUFFER_CONSTRUCTOR;
 
-    static final int HASH_CODE_ASCII_SEED = 0xc2b2ae35; // constant borrowed from murmur3
+    // constants borrowed from murmur3
+    static final int HASH_CODE_ASCII_SEED = 0xc2b2ae35;
+    static final int HASH_CODE_C1 = 0x1b873593;
+    static final int HASH_CODE_C2 = 0x1b873593;
 
     /**
      * Limits the number of bytes to copy per {@link Unsafe#copyMemory(long, long, long)} to allow safepoint polling
@@ -58,54 +58,98 @@ final class PlatformDependent0 {
     private static final boolean UNALIGNED;
 
     static {
-        ByteBuffer direct = ByteBuffer.allocateDirect(1);
-        Field addressField;
-        try {
-            addressField = Buffer.class.getDeclaredField("address");
-            addressField.setAccessible(true);
-            if (addressField.getLong(ByteBuffer.allocate(1)) != 0) {
-                // A heap buffer must have 0 address.
-                addressField = null;
-            } else {
-                if (addressField.getLong(direct) == 0) {
-                    // A direct buffer must have non-zero address.
-                    addressField = null;
+        final ByteBuffer direct = ByteBuffer.allocateDirect(1);
+        final Field addressField;
+        // attempt to access field Buffer#address
+        final Object maybeAddressField = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+            @Override
+            public Object run() {
+                try {
+                    final Field field = Buffer.class.getDeclaredField("address");
+                    field.setAccessible(true);
+                    // if direct really is a direct buffer, address will be non-zero
+                    if (field.getLong(direct) == 0) {
+                        return null;
+                    }
+                    return field;
+                } catch (IllegalAccessException e) {
+                    return e;
+                } catch (NoSuchFieldException e) {
+                    return e;
+                } catch (SecurityException e) {
+                    return e;
                 }
             }
-        } catch (Throwable t) {
-            // Failed to access the address field.
+        });
+
+        if (maybeAddressField instanceof Field) {
+            addressField = (Field) maybeAddressField;
+            logger.debug("java.nio.Buffer.address: available");
+        } else {
+            logger.debug("java.nio.Buffer.address: unavailable", (Exception) maybeAddressField);
             addressField = null;
         }
 
-        logger.debug("java.nio.Buffer.address: {}", addressField != null? "available" : "unavailable");
-
         Unsafe unsafe;
         if (addressField != null) {
-            try {
-                Field unsafeField = Unsafe.class.getDeclaredField("theUnsafe");
-                unsafeField.setAccessible(true);
-                unsafe = (Unsafe) unsafeField.get(null);
-                logger.debug("sun.misc.Unsafe.theUnsafe: {}", unsafe != null ? "available" : "unavailable");
-
-                // Ensure the unsafe supports all necessary methods to work around the mistake in the latest OpenJDK.
-                // https://github.com/netty/netty/issues/1061
-                // http://www.mail-archive.com/jdk6-dev@openjdk.java.net/msg00698.html
-                try {
-                    if (unsafe != null) {
-                        unsafe.getClass().getDeclaredMethod(
-                                "copyMemory", Object.class, long.class, Object.class, long.class, long.class);
-                        logger.debug("sun.misc.Unsafe.copyMemory: available");
+            // attempt to access field Unsafe#theUnsafe
+            final Object maybeUnsafe = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+                @Override
+                public Object run() {
+                    try {
+                        final Field unsafeField = Unsafe.class.getDeclaredField("theUnsafe");
+                        unsafeField.setAccessible(true);
+                        // the unsafe instance
+                        return unsafeField.get(null);
+                    } catch (NoSuchFieldException e) {
+                        return e;
+                    } catch (SecurityException e) {
+                        return e;
+                    } catch (IllegalAccessException e) {
+                        return e;
                     }
-                } catch (NoSuchMethodError t) {
-                    logger.debug("sun.misc.Unsafe.copyMemory: unavailable");
-                    throw t;
-                } catch (NoSuchMethodException e) {
-                    logger.debug("sun.misc.Unsafe.copyMemory: unavailable");
-                    throw e;
                 }
-            } catch (Throwable cause) {
-                // Unsafe.copyMemory(Object, long, Object, long, long) unavailable.
+            });
+
+            // the conditional check here can not be replaced with checking that maybeUnsafe
+            // is an instanceof Unsafe and reversing the if and else blocks; this is because an
+            // instanceof check against Unsafe will trigger a class load and we might not have
+            // the runtime permission accessClassInPackage.sun.misc
+            if (maybeUnsafe instanceof Exception) {
                 unsafe = null;
+                logger.debug("sun.misc.Unsafe.theUnsafe: unavailable", (Exception) maybeUnsafe);
+            } else {
+                unsafe = (Unsafe) maybeUnsafe;
+                logger.debug("sun.misc.Unsafe.theUnsafe: available");
+            }
+
+            // ensure the unsafe supports all necessary methods to work around the mistake in the latest OpenJDK
+            // https://github.com/netty/netty/issues/1061
+            // http://www.mail-archive.com/jdk6-dev@openjdk.java.net/msg00698.html
+            if (unsafe != null) {
+                final Unsafe finalUnsafe = unsafe;
+                final Object maybeException = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+                    @Override
+                    public Object run() {
+                        try {
+                            finalUnsafe.getClass().getDeclaredMethod(
+                                    "copyMemory", Object.class, long.class, Object.class, long.class, long.class);
+                            return null;
+                        } catch (NoSuchMethodException e) {
+                            return e;
+                        } catch (SecurityException e) {
+                            return e;
+                        }
+                    }
+                });
+
+                if (maybeException == null) {
+                    logger.debug("sun.misc.Unsafe.copyMemory: available");
+                } else {
+                    // Unsafe.copyMemory(Object, long, Object, long, long) unavailable.
+                    unsafe = null;
+                    logger.debug("sun.misc.Unsafe.copyMemory: unavailable", (Exception) maybeException);
+                }
             }
         } else {
             // If we cannot access the address of a direct buffer, there's no point of using unsafe.
@@ -117,22 +161,50 @@ final class PlatformDependent0 {
 
         if (unsafe == null) {
             ADDRESS_FIELD_OFFSET = -1;
-            BYTE_ARRAY_BASE_OFFSET = CHAR_ARRAY_BASE_OFFSET = CHAR_ARRAY_INDEX_SCALE = -1;
+            BYTE_ARRAY_BASE_OFFSET = -1;
             UNALIGNED = false;
-            STRING_CHAR_VALUE_FIELD_OFFSET = STRING_BYTE_VALUE_FIELD_OFFSET = -1;
             DIRECT_BUFFER_CONSTRUCTOR = null;
         } else {
             Constructor<?> directBufferConstructor;
             long address = -1;
             try {
-                directBufferConstructor = direct.getClass().getDeclaredConstructor(long.class, int.class);
-                directBufferConstructor.setAccessible(true);
-                address = UNSAFE.allocateMemory(1);
+                final Object maybeDirectBufferConstructor =
+                        AccessController.doPrivileged(new PrivilegedAction<Object>() {
+                            @Override
+                            public Object run() {
+                                try {
+                                    final Constructor constructor =
+                                            direct.getClass().getDeclaredConstructor(long.class, int.class);
+                                    constructor.setAccessible(true);
+                                    return constructor;
+                                } catch (NoSuchMethodException e) {
+                                    return e;
+                                } catch (SecurityException e) {
+                                    return e;
+                                }
+                            }
+                        });
 
-                // Try to use the constructor now
-                directBufferConstructor.newInstance(address, 1);
-            } catch (Throwable t) {
-                directBufferConstructor = null;
+                if (maybeDirectBufferConstructor instanceof Constructor<?>) {
+                    address = UNSAFE.allocateMemory(1);
+                    // try to use the constructor now
+                    try {
+                        ((Constructor) maybeDirectBufferConstructor).newInstance(address, 1);
+                        directBufferConstructor = (Constructor<?>) maybeDirectBufferConstructor;
+                        logger.debug("direct buffer constructor: available");
+                    } catch (InstantiationException e) {
+                        directBufferConstructor = null;
+                    } catch (IllegalAccessException e) {
+                        directBufferConstructor = null;
+                    } catch (InvocationTargetException e) {
+                        directBufferConstructor = null;
+                    }
+                } else {
+                    logger.debug(
+                            "direct buffer constructor: unavailable",
+                            (Exception) maybeDirectBufferConstructor);
+                    directBufferConstructor = null;
+                }
             } finally {
                 if (address != -1) {
                     UNSAFE.freeMemory(address);
@@ -142,69 +214,48 @@ final class PlatformDependent0 {
 
             ADDRESS_FIELD_OFFSET = objectFieldOffset(addressField);
             BYTE_ARRAY_BASE_OFFSET = UNSAFE.arrayBaseOffset(byte[].class);
-            CHAR_ARRAY_BASE_OFFSET = UNSAFE.arrayBaseOffset(char[].class);
-            CHAR_ARRAY_INDEX_SCALE = UNSAFE.arrayIndexScale(char[].class);
             boolean unaligned;
-            try {
-                Class<?> bitsClass = Class.forName("java.nio.Bits", false, ClassLoader.getSystemClassLoader());
-                Method unalignedMethod = bitsClass.getDeclaredMethod("unaligned");
-                unalignedMethod.setAccessible(true);
-                unaligned = Boolean.TRUE.equals(unalignedMethod.invoke(null));
-            } catch (Throwable t) {
-                // We at least know x86 and x64 support unaligned access.
+            Object maybeUnaligned = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+                @Override
+                public Object run() {
+                    try {
+                        Class<?> bitsClass =
+                                Class.forName("java.nio.Bits", false, PlatformDependent.getSystemClassLoader());
+                        Method unalignedMethod = bitsClass.getDeclaredMethod("unaligned");
+                        unalignedMethod.setAccessible(true);
+                        return unalignedMethod.invoke(null);
+                    } catch (ClassNotFoundException e) {
+                        return e;
+                    } catch (NoSuchMethodException e) {
+                        return e;
+                    } catch (InvocationTargetException e) {
+                        return e;
+                    } catch (IllegalAccessException e) {
+                        return e;
+                    } catch (SecurityException e) {
+                        return e;
+                    }
+                }
+            });
+
+            if (maybeUnaligned instanceof Boolean) {
+                unaligned = (Boolean) maybeUnaligned;
+                logger.debug("java.nio.Bits.unaligned: available, {}", unaligned);
+            } else {
                 String arch = SystemPropertyUtil.get("os.arch", "");
                 //noinspection DynamicRegexReplaceableByCompiledPattern
                 unaligned = arch.matches("^(i[3-6]86|x86(_64)?|x64|amd64)$");
+                Exception e = (Exception) maybeUnaligned;
+                logger.debug("java.nio.Bits.unaligned: unavailable, " + unaligned, e);
             }
 
             UNALIGNED = unaligned;
-            logger.debug("java.nio.Bits.unaligned: {}", UNALIGNED);
-
-            Field stringValueField = null;
-            try {
-                stringValueField = AccessController.doPrivileged(new PrivilegedAction<Field>() {
-                    @Override
-                    public Field run() {
-                        try {
-                            Field f = String.class.getDeclaredField("value");
-                            f.setAccessible(true);
-                            return f;
-                        } catch (NoSuchFieldException e) {
-                            logger.info("Failed to find String value array (please report an issue)." +
-                                    "String hash code optimizations are disabled.", e);
-                        } catch (SecurityException e) {
-                            logger.debug("No permissions to get String value array." +
-                                    "String hash code optimizations are disabled.", e);
-                        }
-                        return null;
-                    }
-                });
-            } catch (Throwable t) {
-                logger.debug("AccessController.doPrivileged failed to get String value array." +
-                        "String hash code optimizations are disabled.", t);
-            }
-
-            if (stringValueField == null) {
-                STRING_CHAR_VALUE_FIELD_OFFSET = STRING_BYTE_VALUE_FIELD_OFFSET = -1;
-            } else {
-                long stringValueFieldOffset = UNSAFE.objectFieldOffset(stringValueField);
-                Object o = UNSAFE.getObject("", stringValueFieldOffset);
-                if (char[].class.isInstance(o)) {
-                    STRING_CHAR_VALUE_FIELD_OFFSET = stringValueFieldOffset;
-                    STRING_BYTE_VALUE_FIELD_OFFSET = -1;
-                } else if (byte[].class.isInstance(o)) {
-                    STRING_CHAR_VALUE_FIELD_OFFSET = -1;
-                    STRING_BYTE_VALUE_FIELD_OFFSET = stringValueFieldOffset;
-                } else {
-                    STRING_CHAR_VALUE_FIELD_OFFSET = STRING_BYTE_VALUE_FIELD_OFFSET = -1;
-                    logger.info("Unexpected type [" + o.getClass() + "] for String value array." +
-                            "String hash code optimizations are disabled.");
-                }
-            }
         }
 
         logger.debug("java.nio.DirectByteBuffer.<init>(long, int): {}",
-                DIRECT_BUFFER_CONSTRUCTOR != null? "available" : "unavailable");
+                DIRECT_BUFFER_CONSTRUCTOR != null ? "available" : "unavailable");
+
+        freeDirectBuffer(direct);
     }
 
     static boolean isUnaligned() {
@@ -236,7 +287,10 @@ final class PlatformDependent0 {
         return newDirectBuffer(UNSAFE.allocateMemory(capacity), capacity);
     }
 
-    private static ByteBuffer newDirectBuffer(long address, int capacity) {
+    static ByteBuffer newDirectBuffer(long address, int capacity) {
+        ObjectUtil.checkPositiveOrZero(address, "address");
+        ObjectUtil.checkPositiveOrZero(capacity, "capacity");
+
         try {
             return (ByteBuffer) DIRECT_BUFFER_CONSTRUCTOR.newInstance(address, capacity);
         } catch (Throwable cause) {
@@ -381,38 +435,31 @@ final class PlatformDependent0 {
     }
 
     static boolean equals(byte[] bytes1, int startPos1, byte[] bytes2, int startPos2, int length) {
+        if (length == 0) {
+            return true;
+        }
         final long baseOffset1 = BYTE_ARRAY_BASE_OFFSET + startPos1;
         final long baseOffset2 = BYTE_ARRAY_BASE_OFFSET + startPos2;
-        final int remainingBytes = length & 7;
+        int remainingBytes = length & 7;
         final long end = baseOffset1 + remainingBytes;
         for (long i = baseOffset1 - 8 + length, j = baseOffset2 - 8 + length; i >= end; i -= 8, j -= 8) {
             if (UNSAFE.getLong(bytes1, i) != UNSAFE.getLong(bytes2, j)) {
                 return false;
             }
         }
-        switch (remainingBytes) {
-        case 7:
-            return UNSAFE.getInt(bytes1, baseOffset1 + 3) == UNSAFE.getInt(bytes2, baseOffset2 + 3) &&
-                   UNSAFE.getChar(bytes1, baseOffset1 + 1) == UNSAFE.getChar(bytes2, baseOffset2 + 1) &&
-                   UNSAFE.getByte(bytes1, baseOffset1) == UNSAFE.getByte(bytes2, baseOffset2);
-        case 6:
-            return UNSAFE.getInt(bytes1, baseOffset1 + 2) == UNSAFE.getInt(bytes2, baseOffset2 + 2) &&
-                   UNSAFE.getChar(bytes1, baseOffset1) == UNSAFE.getChar(bytes2, baseOffset2);
-        case 5:
-            return UNSAFE.getInt(bytes1, baseOffset1 + 1) == UNSAFE.getInt(bytes2, baseOffset2 + 1) &&
-                   UNSAFE.getByte(bytes1, baseOffset1) == UNSAFE.getByte(bytes2, baseOffset2);
-        case 4:
-            return UNSAFE.getInt(bytes1, baseOffset1) == UNSAFE.getInt(bytes2, baseOffset2);
-        case 3:
-            return UNSAFE.getChar(bytes1, baseOffset1 + 1) == UNSAFE.getChar(bytes2, baseOffset2 + 1) &&
-                   UNSAFE.getByte(bytes1, baseOffset1) == UNSAFE.getByte(bytes2, baseOffset2);
-        case 2:
-            return UNSAFE.getChar(bytes1, baseOffset1) == UNSAFE.getChar(bytes2, baseOffset2);
-        case 1:
-            return UNSAFE.getByte(bytes1, baseOffset1) == UNSAFE.getByte(bytes2, baseOffset2);
-        default:
-            return true;
+
+        if (remainingBytes >= 4) {
+            remainingBytes -= 4;
+            if (UNSAFE.getInt(bytes1, baseOffset1 + remainingBytes) !=
+                UNSAFE.getInt(bytes2, baseOffset2 + remainingBytes)) {
+                return false;
+            }
         }
+        if (remainingBytes >= 2) {
+            return UNSAFE.getChar(bytes1, baseOffset1) == UNSAFE.getChar(bytes2, baseOffset2) &&
+                   (remainingBytes == 2 || bytes1[startPos1 + 2] == bytes2[startPos2 + 2]);
+        }
+        return bytes1[startPos1] == bytes2[startPos2];
     }
 
     static int equalsConstantTime(byte[] bytes1, int startPos1, byte[] bytes2, int startPos2, int length) {
@@ -456,170 +503,58 @@ final class PlatformDependent0 {
         }
     }
 
-    static int hashCodeAscii(byte[] bytes) {
-        return hashCodeAscii(bytes, 0, bytes.length);
-    }
-
-    /**
-     * This must remain consistent with {@link #hashCodeAscii(char[])}.
-     */
     static int hashCodeAscii(byte[] bytes, int startPos, int length) {
         int hash = HASH_CODE_ASCII_SEED;
         final long baseOffset = BYTE_ARRAY_BASE_OFFSET + startPos;
         final int remainingBytes = length & 7;
-        if (length > 7) { // Fast path for small sized inputs. Benchmarking shows this is beneficial.
-            final long end = baseOffset + remainingBytes;
-            for (long i = baseOffset - 8 + length; i >= end; i -= 8) {
-                hash = hashCodeAsciiCompute(UNSAFE.getLong(bytes, i), hash);
-            }
+        final long end = baseOffset + remainingBytes;
+        for (long i = baseOffset - 8 + length; i >= end; i -= 8) {
+            hash = hashCodeAsciiCompute(UNSAFE.getLong(bytes, i), hash);
         }
         switch(remainingBytes) {
         case 7:
-            return ((hash * 31 + Integer.rotateLeft(hashCodeAsciiSanitize(UNSAFE.getInt(bytes, baseOffset + 3)), 13))
-                     * 31 + hashCodeAsciiSanitize(UNSAFE.getShort(bytes, baseOffset + 1)))
-                       * 31 + hashCodeAsciiSanitize(UNSAFE.getByte(bytes, baseOffset));
+            return ((hash * HASH_CODE_C1 + hashCodeAsciiSanitize(UNSAFE.getByte(bytes, baseOffset)))
+                          * HASH_CODE_C2 + hashCodeAsciiSanitize(UNSAFE.getShort(bytes, baseOffset + 1)))
+                          * HASH_CODE_C1 + hashCodeAsciiSanitize(UNSAFE.getInt(bytes, baseOffset + 3));
         case 6:
-            return (hash * 31 + Integer.rotateLeft(hashCodeAsciiSanitize(UNSAFE.getInt(bytes, baseOffset + 2)), 13))
-                    * 31 + hashCodeAsciiSanitize(UNSAFE.getShort(bytes, baseOffset));
+            return (hash * HASH_CODE_C1 + hashCodeAsciiSanitize(UNSAFE.getShort(bytes, baseOffset)))
+                         * HASH_CODE_C2 + hashCodeAsciiSanitize(UNSAFE.getInt(bytes, baseOffset + 2));
         case 5:
-            return (hash * 31 + Integer.rotateLeft(hashCodeAsciiSanitize(UNSAFE.getInt(bytes, baseOffset + 1)), 13))
-                    * 31 + hashCodeAsciiSanitize(UNSAFE.getByte(bytes, baseOffset));
+            return (hash * HASH_CODE_C1 + hashCodeAsciiSanitize(UNSAFE.getByte(bytes, baseOffset)))
+                         * HASH_CODE_C2 + hashCodeAsciiSanitize(UNSAFE.getInt(bytes, baseOffset + 1));
         case 4:
-            return hash * 31 + hashCodeAsciiSanitize(UNSAFE.getInt(bytes, baseOffset));
+            return hash * HASH_CODE_C1 + hashCodeAsciiSanitize(UNSAFE.getInt(bytes, baseOffset));
         case 3:
-            return (hash * 31 + hashCodeAsciiSanitize(UNSAFE.getShort(bytes, baseOffset + 1)))
-                    * 31 + hashCodeAsciiSanitize(UNSAFE.getByte(bytes, baseOffset));
+            return (hash * HASH_CODE_C1 + hashCodeAsciiSanitize(UNSAFE.getByte(bytes, baseOffset)))
+                         * HASH_CODE_C2 + hashCodeAsciiSanitize(UNSAFE.getShort(bytes, baseOffset + 1));
         case 2:
-            return hash * 31 + hashCodeAsciiSanitize(UNSAFE.getShort(bytes, baseOffset));
+            return hash * HASH_CODE_C1 + hashCodeAsciiSanitize(UNSAFE.getShort(bytes, baseOffset));
         case 1:
-            return hash * 31 + hashCodeAsciiSanitize(UNSAFE.getByte(bytes, baseOffset));
+            return hash * HASH_CODE_C1 + hashCodeAsciiSanitize(UNSAFE.getByte(bytes, baseOffset));
         default:
             return hash;
         }
-    }
-
-    /**
-     * This method assumes that {@code bytes} is equivalent to a {@code byte[]} but just using {@code char[]}
-     * for storage. The MSB of each {@code char} from {@code bytes} is ignored.
-     * <p>
-     * This must remain consistent with {@link #hashCodeAscii(byte[], int, int)}.
-     */
-    static int hashCodeAscii(char[] bytes) {
-        int hash = HASH_CODE_ASCII_SEED;
-        final int remainingBytes = bytes.length & 7;
-        for (int i = bytes.length - 8; i >= remainingBytes; i -= 8) {
-            hash = hashCodeAsciiComputeFromChar(
-                                  UNSAFE.getLong(bytes, CHAR_ARRAY_BASE_OFFSET + i * CHAR_ARRAY_INDEX_SCALE),
-                                  UNSAFE.getLong(bytes, CHAR_ARRAY_BASE_OFFSET + (i + 4) * CHAR_ARRAY_INDEX_SCALE),
-                                  hash);
-        }
-        switch(remainingBytes) {
-        case 7:
-            return ((hash * 31 + Integer.rotateLeft(hashCodeAsciiSanitizeFromChar(
-                            UNSAFE.getLong(bytes, CHAR_ARRAY_BASE_OFFSET + 3 * CHAR_ARRAY_INDEX_SCALE)), 13))
-                     * 31 + hashCodeAsciiSanitizeFromChar(
-                             UNSAFE.getInt(bytes, CHAR_ARRAY_BASE_OFFSET + CHAR_ARRAY_INDEX_SCALE)))
-                       * 31 + hashCodeAsciiSanitizeFromChar(
-                               UNSAFE.getShort(bytes, CHAR_ARRAY_BASE_OFFSET));
-        case 6:
-            return (hash * 31 + Integer.rotateLeft(hashCodeAsciiSanitizeFromChar(
-                            UNSAFE.getLong(bytes, CHAR_ARRAY_BASE_OFFSET + 2 * CHAR_ARRAY_INDEX_SCALE)), 13))
-                    * 31 + hashCodeAsciiSanitizeFromChar(
-                            UNSAFE.getInt(bytes, CHAR_ARRAY_BASE_OFFSET));
-        case 5:
-            return (hash * 31 + Integer.rotateLeft(hashCodeAsciiSanitizeFromChar(
-                            UNSAFE.getLong(bytes, CHAR_ARRAY_BASE_OFFSET + CHAR_ARRAY_INDEX_SCALE)), 13))
-                    * 31 + hashCodeAsciiSanitizeFromChar(
-                            UNSAFE.getShort(bytes, CHAR_ARRAY_BASE_OFFSET));
-        case 4:
-            return hash * 31 + hashCodeAsciiSanitizeFromChar(
-                            UNSAFE.getLong(bytes, CHAR_ARRAY_BASE_OFFSET));
-        case 3:
-            return (hash * 31 + hashCodeAsciiSanitizeFromChar(
-                            UNSAFE.getInt(bytes, CHAR_ARRAY_BASE_OFFSET + CHAR_ARRAY_INDEX_SCALE)))
-                    * 31 + hashCodeAsciiSanitizeFromChar(
-                            UNSAFE.getShort(bytes, CHAR_ARRAY_BASE_OFFSET));
-        case 2:
-            return hash * 31 + hashCodeAsciiSanitizeFromChar(
-                            UNSAFE.getInt(bytes, CHAR_ARRAY_BASE_OFFSET));
-        case 1:
-            return hash * 31 + hashCodeAsciiSanitizeFromChar(
-                            UNSAFE.getShort(bytes, CHAR_ARRAY_BASE_OFFSET));
-        default:
-            return hash;
-        }
-    }
-
-    static boolean hasCharArray(CharSequence data) {
-        return STRING_CHAR_VALUE_FIELD_OFFSET != -1 && data.getClass() == String.class;
-    }
-
-    static boolean hasByteArray(CharSequence data) {
-        return STRING_BYTE_VALUE_FIELD_OFFSET != -1 && data.getClass() == String.class;
-    }
-
-    /**
-     * Callers are expected to call {@link #hasCharArray(CharSequence)} before calling this method.
-     */
-    static char[] charArray(CharSequence data) {
-        return (char[]) UNSAFE.getObject(data, STRING_CHAR_VALUE_FIELD_OFFSET);
-    }
-
-    /**
-     * Callers are expected to call {@link #hasByteArray(CharSequence)} before calling this method.
-     */
-    static byte[] byteArray(CharSequence data) {
-        return (byte[]) UNSAFE.getObject(data, STRING_BYTE_VALUE_FIELD_OFFSET);
     }
 
     static int hashCodeAsciiCompute(long value, int hash) {
         // masking with 0x1f reduces the number of overall bits that impact the hash code but makes the hash
         // code the same regardless of character case (upper case or lower case hash is the same).
-        return (hash * 31 +
-                // High order int
-                (int) ((value & 0x1f1f1f1f00000000L) >>> 32)) * 31 +
+        return hash * HASH_CODE_C1 +
                 // Low order int
-                hashCodeAsciiSanitize((int) value);
-    }
-
-    static int hashCodeAsciiComputeFromChar(long high, long low, int hash) {
-        // masking with 0x1f reduces the number of overall bits that impact the hash code but makes the hash
-        // code the same regardless of character case (upper case or lower case hash is the same).
-        return (hash * 31 +
-                // High order int (which is low order for char)
-                hashCodeAsciiSanitizeFromChar(low)) * 31 +
-                // Low order int (which is high order for char)
-                hashCodeAsciiSanitizeFromChar(high);
+                hashCodeAsciiSanitize((int) value) * HASH_CODE_C2 +
+                // High order int
+                (int) ((value & 0x1f1f1f1f00000000L) >>> 32);
     }
 
     static int hashCodeAsciiSanitize(int value) {
         return value & 0x1f1f1f1f;
     }
 
-    private static int hashCodeAsciiSanitizeFromChar(long value) {
-        return (int) (((value & 0x1f000000000000L) >>> 24) |
-                      ((value & 0x1f00000000L) >>> 16) |
-                      ((value & 0x1f0000) >>> 8) |
-                      (value & 0x1f));
-    }
-
     static int hashCodeAsciiSanitize(short value) {
         return value & 0x1f1f;
     }
 
-    private static int hashCodeAsciiSanitizeFromChar(int value) {
-        return ((value & 0x1f0000) >>> 8) | (value & 0x1f);
-    }
-
-    static int hashCodeAsciiSanitizeAsByte(char value) {
-        return value & 0x1f;
-    }
-
     static int hashCodeAsciiSanitize(byte value) {
-        return value & 0x1f;
-    }
-
-    private static int hashCodeAsciiSanitizeFromChar(short value) {
         return value & 0x1f;
     }
 
