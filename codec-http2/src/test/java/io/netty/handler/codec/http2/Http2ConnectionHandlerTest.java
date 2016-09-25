@@ -22,8 +22,10 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.DefaultChannelPromise;
+import io.netty.handler.codec.http2.Http2CodecUtil.SimpleChannelPromiseAggregator;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.GenericFutureListener;
@@ -47,9 +49,11 @@ import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
 import static io.netty.handler.codec.http2.Http2Error.STREAM_CLOSED;
 import static io.netty.handler.codec.http2.Http2Stream.State.CLOSED;
 import static io.netty.handler.codec.http2.Http2Stream.State.IDLE;
+import static io.netty.handler.codec.http2.Http2TestUtil.newVoidPromise;
 import static io.netty.util.CharsetUtil.UTF_8;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyBoolean;
@@ -105,6 +109,9 @@ public class Http2ConnectionHandlerTest {
     private Channel channel;
 
     @Mock
+    private ChannelPipeline pipeline;
+
+    @Mock
     private ChannelFuture future;
 
     @Mock
@@ -154,6 +161,7 @@ public class Http2ConnectionHandlerTest {
         when(future.cause()).thenReturn(fakeException);
         when(future.channel()).thenReturn(channel);
         when(channel.isActive()).thenReturn(true);
+        when(channel.pipeline()).thenReturn(pipeline);
         when(connection.remote()).thenReturn(remote);
         when(remote.flowController()).thenReturn(remoteFlowController);
         when(connection.local()).thenReturn(local);
@@ -418,25 +426,46 @@ public class Http2ConnectionHandlerTest {
     public void cannotSendGoAwayFrameWithIncreasingLastStreamIds() throws Exception {
         handler = newHandler();
         ByteBuf data = dummyData();
-        try {
-            long errorCode = Http2Error.INTERNAL_ERROR.code();
+        long errorCode = Http2Error.INTERNAL_ERROR.code();
 
-            handler.goAway(ctx, STREAM_ID, errorCode, data.retain(), promise);
-            verify(connection).goAwaySent(eq(STREAM_ID), eq(errorCode), eq(data));
-            verify(frameWriter).writeGoAway(eq(ctx), eq(STREAM_ID), eq(errorCode), eq(data), eq(promise));
-            // The frameWriter is only mocked, so it should not have interacted with the promise.
-            assertFalse(promise.isDone());
+        handler.goAway(ctx, STREAM_ID, errorCode, data.retain(), promise);
+        verify(connection).goAwaySent(eq(STREAM_ID), eq(errorCode), eq(data));
+        verify(frameWriter).writeGoAway(eq(ctx), eq(STREAM_ID), eq(errorCode), eq(data), eq(promise));
+        // The frameWriter is only mocked, so it should not have interacted with the promise.
+        assertFalse(promise.isDone());
 
-            when(connection.goAwaySent()).thenReturn(true);
-            when(remote.lastStreamKnownByPeer()).thenReturn(STREAM_ID);
-            handler.goAway(ctx, STREAM_ID + 2, errorCode, data, promise);
-            assertTrue(promise.isDone());
-            assertFalse(promise.isSuccess());
-            assertEquals(1, data.refCnt());
-            verifyNoMoreInteractions(frameWriter);
-        } finally {
-            data.release();
-        }
+        when(connection.goAwaySent()).thenReturn(true);
+        when(remote.lastStreamKnownByPeer()).thenReturn(STREAM_ID);
+        handler.goAway(ctx, STREAM_ID + 2, errorCode, data, promise);
+        assertTrue(promise.isDone());
+        assertFalse(promise.isSuccess());
+        assertEquals(0, data.refCnt());
+        verifyNoMoreInteractions(frameWriter);
+    }
+
+    @Test
+    public void canSendGoAwayUsingVoidPromise() throws Exception {
+        handler = newHandler();
+        ByteBuf data = dummyData();
+        long errorCode = Http2Error.INTERNAL_ERROR.code();
+        handler = newHandler();
+        final Throwable cause = new RuntimeException("fake exception");
+        doAnswer(new Answer<ChannelFuture>() {
+            @Override
+            public ChannelFuture answer(InvocationOnMock invocation) throws Throwable {
+                ChannelPromise promise = invocation.getArgumentAt(4, ChannelPromise.class);
+                assertFalse(promise.isVoid());
+                // This is what DefaultHttp2FrameWriter does... I hate mocking :-(.
+                SimpleChannelPromiseAggregator aggregatedPromise =
+                        new SimpleChannelPromiseAggregator(promise, channel, ImmediateEventExecutor.INSTANCE);
+                aggregatedPromise.newPromise();
+                aggregatedPromise.doneAllocatingPromises();
+                return aggregatedPromise.setFailure(cause);
+            }
+        }).when(frameWriter).writeGoAway(
+                any(ChannelHandlerContext.class), anyInt(), anyInt(), any(ByteBuf.class), any(ChannelPromise.class));
+        handler.goAway(ctx, STREAM_ID, errorCode, data, newVoidPromise(channel));
+        verify(pipeline).fireExceptionCaught(cause);
     }
 
     @Test
@@ -456,6 +485,33 @@ public class Http2ConnectionHandlerTest {
                                                  any(ByteBuf.class), any(ChannelPromise.class));
         verify(frameWriter, never()).writeRstStream(any(ChannelHandlerContext.class), anyInt(), anyLong(),
                                                     any(ChannelPromise.class));
+    }
+
+    @Test
+    public void writeRstStreamForUnkownStreamUsingVoidPromise() throws Exception {
+        writeRstStreamUsingVoidPromise(NON_EXISTANT_STREAM_ID);
+    }
+
+    @Test
+    public void writeRstStreamForKnownStreamUsingVoidPromise() throws Exception {
+        writeRstStreamUsingVoidPromise(STREAM_ID);
+    }
+
+    private void writeRstStreamUsingVoidPromise(int streamId) throws Exception {
+        handler = newHandler();
+        final Throwable cause = new RuntimeException("fake exception");
+        when(frameWriter.writeRstStream(eq(ctx), eq(streamId), anyLong(), any(ChannelPromise.class)))
+                .then(new Answer<ChannelFuture>() {
+                    @Override
+                    public ChannelFuture answer(InvocationOnMock invocationOnMock) throws Throwable {
+                        ChannelPromise promise = invocationOnMock.getArgumentAt(3, ChannelPromise.class);
+                        assertFalse(promise.isVoid());
+                        return promise.setFailure(cause);
+                    }
+                });
+        handler.resetStream(ctx, streamId, STREAM_CLOSED.code(), newVoidPromise(channel));
+        verify(frameWriter).writeRstStream(eq(ctx), eq(streamId), anyLong(), any(ChannelPromise.class));
+        verify(pipeline).fireExceptionCaught(cause);
     }
 
     private static ByteBuf dummyData() {
