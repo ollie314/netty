@@ -34,13 +34,13 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.Promise;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import java.net.ConnectException;
 import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadFactory;
@@ -364,7 +364,7 @@ public class LocalChannelTest {
 
                 final Channel ccCpy = cc;
                 // Make sure a write operation is executed in the eventloop
-                cc.pipeline().lastContext().executor().execute(new OneTimeTask() {
+                cc.pipeline().lastContext().executor().execute(new Runnable() {
                     @Override
                     public void run() {
                         ChannelPromise promise = ccCpy.newPromise();
@@ -428,7 +428,7 @@ public class LocalChannelTest {
 
                 final Channel ccCpy = cc;
                 // Make sure a write operation is executed in the eventloop
-                cc.pipeline().lastContext().executor().execute(new OneTimeTask() {
+                cc.pipeline().lastContext().executor().execute(new Runnable() {
                     @Override
                     public void run() {
                         ChannelPromise promise = ccCpy.newPromise();
@@ -510,7 +510,7 @@ public class LocalChannelTest {
 
             final Channel ccCpy = cc;
             // Make sure a write operation is executed in the eventloop
-            cc.pipeline().lastContext().executor().execute(new OneTimeTask() {
+            cc.pipeline().lastContext().executor().execute(new Runnable() {
                 @Override
                 public void run() {
                     ChannelPromise promise = ccCpy.newPromise();
@@ -592,7 +592,7 @@ public class LocalChannelTest {
 
                 final Channel ccCpy = cc;
                 // Make sure a write operation is executed in the eventloop
-                cc.pipeline().lastContext().executor().execute(new OneTimeTask() {
+                cc.pipeline().lastContext().executor().execute(new Runnable() {
                     @Override
                     public void run() {
                         ChannelPromise promise = ccCpy.newPromise();
@@ -672,7 +672,7 @@ public class LocalChannelTest {
 
                 final Channel ccCpy = cc;
                 // Make sure a write operation is executed in the eventloop
-                cc.pipeline().lastContext().executor().execute(new OneTimeTask() {
+                cc.pipeline().lastContext().executor().execute(new Runnable() {
                     @Override
                     public void run() {
                         ChannelPromise promise = ccCpy.newPromise();
@@ -753,14 +753,14 @@ public class LocalChannelTest {
                 ccCpy.closeFuture().addListener(clientChannelCloseLatch);
 
                 // Make sure a write operation is executed in the eventloop
-                cc.pipeline().lastContext().executor().execute(new OneTimeTask() {
+                cc.pipeline().lastContext().executor().execute(new Runnable() {
                     @Override
                     public void run() {
                         ccCpy.writeAndFlush(data.duplicate().retain(), ccCpy.newPromise())
                         .addListener(new ChannelFutureListener() {
                             @Override
                             public void operationComplete(ChannelFuture future) throws Exception {
-                                serverChannelCpy.eventLoop().execute(new OneTimeTask() {
+                                serverChannelCpy.eventLoop().execute(new Runnable() {
                                     @Override
                                     public void run() {
                                         // The point of this test is to write while the peer is closed, so we should
@@ -860,6 +860,15 @@ public class LocalChannelTest {
             closeChannel(cc);
             closeChannel(sc);
         }
+    }
+
+    @Test(expected = ConnectException.class)
+    public void testConnectionRefused() {
+        Bootstrap sb = new Bootstrap();
+        sb.group(group1)
+        .channel(LocalChannel.class)
+        .handler(new TestHandler())
+        .connect(LocalAddress.ANY).syncUninterruptibly();
     }
 
     private static final class LatchChannelFutureListener extends CountDownLatch implements ChannelFutureListener {

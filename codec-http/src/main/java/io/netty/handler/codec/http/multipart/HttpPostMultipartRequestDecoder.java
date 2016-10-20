@@ -28,10 +28,12 @@ import io.netty.handler.codec.http.multipart.HttpPostRequestDecoder.EndOfDataDec
 import io.netty.handler.codec.http.multipart.HttpPostRequestDecoder.ErrorDataDecoderException;
 import io.netty.handler.codec.http.multipart.HttpPostRequestDecoder.MultiPartStatus;
 import io.netty.handler.codec.http.multipart.HttpPostRequestDecoder.NotEnoughDataDecoderException;
+import io.netty.util.internal.InternalThreadLocalMap;
 import io.netty.util.internal.StringUtil;
 
 import java.io.IOException;
 import java.nio.charset.Charset;
+import java.nio.charset.UnsupportedCharsetException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -496,6 +498,8 @@ public class HttpPostMultipartRequestDecoder implements InterfaceHttpPostRequest
                     localCharset = Charset.forName(charsetAttribute.getValue());
                 } catch (IOException e) {
                     throw new ErrorDataDecoderException(e);
+                } catch (UnsupportedCharsetException e) {
+                    throw new ErrorDataDecoderException(e);
                 }
             }
             Attribute nameAttribute = currentFieldAttributes.get(HttpPostBodyUtil.NAME);
@@ -673,7 +677,7 @@ public class HttpPostMultipartRequestDecoder implements InterfaceHttpPostRequest
                 if (checkSecondArg) {
                     // read next values and store them in the map as Attribute
                     for (int i = 2; i < contents.length; i++) {
-                        String[] values = StringUtil.split(contents[i], '=', 2);
+                        String[] values = contents[i].split("=", 2);
                         Attribute attribute;
                         try {
                             String name = cleanString(values[0]);
@@ -827,6 +831,8 @@ public class HttpPostMultipartRequestDecoder implements InterfaceHttpPostRequest
             try {
                 localCharset = Charset.forName(charsetAttribute.getValue());
             } catch (IOException e) {
+                throw new ErrorDataDecoderException(e);
+            } catch (UnsupportedCharsetException e) {
                 throw new ErrorDataDecoderException(e);
             }
         }
@@ -1790,7 +1796,7 @@ public class HttpPostMultipartRequestDecoder implements InterfaceHttpPostRequest
         if (svalue.indexOf(';') >= 0) {
             values = splitMultipartHeaderValues(svalue);
         } else {
-            values = StringUtil.split(svalue, ',');
+            values = svalue.split(",");
         }
         for (String value : values) {
             headers.add(value.trim());
@@ -1807,7 +1813,7 @@ public class HttpPostMultipartRequestDecoder implements InterfaceHttpPostRequest
      * @return an array of String where values that were separated by ';' or ','
      */
     private static String[] splitMultipartHeaderValues(String svalue) {
-        List<String> values = new ArrayList<String>(1);
+        List<String> values = InternalThreadLocalMap.get().arrayList(1);
         boolean inQuote = false;
         boolean escapeNext = false;
         int start = 0;

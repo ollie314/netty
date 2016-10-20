@@ -24,8 +24,8 @@ import io.netty.util.Recycler.Handle;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.internal.InternalThreadLocalMap;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.PromiseNotificationUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -175,7 +175,7 @@ public final class ChannelOutboundBuffer {
         }
 
         long newWriteBufferSize = TOTAL_PENDING_SIZE_UPDATER.addAndGet(this, size);
-        if (newWriteBufferSize >= channel.config().getWriteBufferHighWaterMark()) {
+        if (newWriteBufferSize > channel.config().getWriteBufferHighWaterMark()) {
             setUnwritable(invokeLater);
         }
     }
@@ -194,8 +194,7 @@ public final class ChannelOutboundBuffer {
         }
 
         long newWriteBufferSize = TOTAL_PENDING_SIZE_UPDATER.addAndGet(this, -size);
-        if (notifyWritability && (newWriteBufferSize == 0
-            || newWriteBufferSize <= channel.config().getWriteBufferLowWaterMark())) {
+        if (notifyWritability && newWriteBufferSize < channel.config().getWriteBufferLowWaterMark()) {
             setWritable(invokeLater);
         }
     }
@@ -630,7 +629,7 @@ public final class ChannelOutboundBuffer {
 
     void close(final ClosedChannelException cause) {
         if (inFail) {
-            channel.eventLoop().execute(new OneTimeTask() {
+            channel.eventLoop().execute(new Runnable() {
                 @Override
                 public void run() {
                     close(cause);
@@ -670,14 +669,14 @@ public final class ChannelOutboundBuffer {
     }
 
     private static void safeSuccess(ChannelPromise promise) {
-        if (!(promise instanceof VoidChannelPromise) && !promise.trySuccess()) {
-            logger.warn("Failed to mark a promise as success because it is done already: {}", promise);
+        if (!(promise instanceof VoidChannelPromise)) {
+            PromiseNotificationUtil.trySuccess(promise, null, logger);
         }
     }
 
     private static void safeFail(ChannelPromise promise, Throwable cause) {
-        if (!(promise instanceof VoidChannelPromise) && !promise.tryFailure(cause)) {
-            logger.warn("Failed to mark a promise as failure because it's done already: {}", promise, cause);
+        if (!(promise instanceof VoidChannelPromise)) {
+            PromiseNotificationUtil.tryFailure(promise, cause, logger);
         }
     }
 

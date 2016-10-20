@@ -20,7 +20,7 @@
   <parent>
     <groupId>io.netty</groupId>
     <artifactId>netty-parent</artifactId>
-    <version>4.0.35.Final-SNAPSHOT</version>
+    <version>4.0.43.Final-SNAPSHOT</version>
   </parent>
 
   <artifactId>netty-all</artifactId>
@@ -257,6 +257,7 @@
             <configuration>
               <classifier>sources</classifier>
               <includes>io/netty/**</includes>
+              <includeScope>runtime</includeScope>
               <includeGroupIds>${project.groupId}</includeGroupIds>
               <outputDirectory>${generatedSourceDir}</outputDirectory>
             </configuration>
@@ -272,6 +273,7 @@
             <configuration>
               <excludes>io/netty/example/**,META-INF/native/libnetty-tcnative*</excludes>
               <includes>io/netty/**,META-INF/native/**</includes>
+              <includeScope>runtime</includeScope>
               <includeGroupIds>${project.groupId}</includeGroupIds>
               <outputDirectory>${project.build.outputDirectory}</outputDirectory>
             </configuration>
@@ -305,7 +307,7 @@
                       </patternset>
                     </unzip>
                     <concat destfile="${project.build.outputDirectory}/META-INF/${project.groupId}.versions.properties" append="true">
-                            <path path="${dependencyVersionsDir}/META-INF/${project.groupId}.versions.properties" />
+                      <path path="${dependencyVersionsDir}/META-INF/${project.groupId}.versions.properties" />
                     </concat>
                   </sequential>
                 </for>
@@ -377,14 +379,14 @@
             <goals>
               <goal>jar</goal>
             </goals>
-        <configuration>
-          <archive>
-            <manifest>
-              <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
-            </manifest>
-            <index>true</index>
-          </archive>
-        </configuration>
+            <configuration>
+              <archive>
+                <manifest>
+                  <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+                </manifest>
+                <index>true</index>
+              </archive>
+            </configuration>
           </execution>
         </executions>
       </plugin>
@@ -503,7 +505,7 @@
             -link http://code.google.com/apis/protocolbuffers/docs/reference/java/
             -link http://docs.oracle.com/javaee/6/api/
             -link http://www.slf4j.org/apidocs/
-            -link http://commons.apache.org/proper/commons-logging/javadocs/api-1.1.2/
+            -link https://commons.apache.org/proper/commons-logging/apidocs/
             -link http://logging.apache.org/log4j/1.2/apidocs/
 
             -group "Low-level data representation" io.netty.buffer*

@@ -22,7 +22,6 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.socket.ChannelInputShutdownEvent;
-import io.netty.util.internal.RecyclableArrayList;
 import io.netty.util.internal.StringUtil;
 
 import java.util.List;
@@ -120,11 +119,10 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
                 if (cumulation instanceof CompositeByteBuf) {
                     composite = (CompositeByteBuf) cumulation;
                 } else {
-                    int readable = cumulation.readableBytes();
-                    composite = alloc.compositeBuffer();
-                    composite.addComponent(cumulation).writerIndex(readable);
+                    composite = alloc.compositeBuffer(Integer.MAX_VALUE);
+                    composite.addComponent(true, cumulation);
                 }
-                composite.addComponent(in).writerIndex(composite.writerIndex() + in.readableBytes());
+                composite.addComponent(true, in);
                 buffer = composite;
             }
             return buffer;
@@ -209,18 +207,23 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
 
     @Override
     public final void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
-        ByteBuf buf = internalBuffer();
-        int readable = buf.readableBytes();
-        if (readable > 0) {
-            ByteBuf bytes = buf.readBytes(readable);
-            buf.release();
-            ctx.fireChannelRead(bytes);
-        } else {
-            buf.release();
+        ByteBuf buf = cumulation;
+        if (buf != null) {
+            // Directly set this to null so we are sure we not access it in any other method here anymore.
+            cumulation = null;
+
+            int readable = buf.readableBytes();
+            if (readable > 0) {
+                ByteBuf bytes = buf.readBytes(readable);
+                buf.release();
+                ctx.fireChannelRead(bytes);
+            } else {
+                buf.release();
+            }
+
+            numReads = 0;
+            ctx.fireChannelReadComplete();
         }
-        cumulation = null;
-        numReads = 0;
-        ctx.fireChannelReadComplete();
         handlerRemoved0(ctx);
     }
 
@@ -233,7 +236,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         if (msg instanceof ByteBuf) {
-            RecyclableArrayList out = RecyclableArrayList.newInstance();
+            CodecOutputList out = CodecOutputList.newInstance();
             try {
                 ByteBuf data = (ByteBuf) msg;
                 first = cumulation == null;
@@ -273,8 +276,21 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
      * Get {@code numElements} out of the {@link List} and forward these through the pipeline.
      */
     static void fireChannelRead(ChannelHandlerContext ctx, List<Object> msgs, int numElements) {
+        if (msgs instanceof CodecOutputList) {
+            fireChannelRead(ctx, (CodecOutputList) msgs, numElements);
+        } else {
+            for (int i = 0; i < numElements; i++) {
+                ctx.fireChannelRead(msgs.get(i));
+            }
+        }
+    }
+
+    /**
+     * Get {@code numElements} out of the {@link CodecOutputList} and forward these through the pipeline.
+     */
+    static void fireChannelRead(ChannelHandlerContext ctx, CodecOutputList msgs, int numElements) {
         for (int i = 0; i < numElements; i ++) {
-            ctx.fireChannelRead(msgs.get(i));
+            ctx.fireChannelRead(msgs.getUnsafe(i));
         }
     }
 
@@ -321,14 +337,9 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
     }
 
     private void channelInputClosed(ChannelHandlerContext ctx, boolean callChannelInactive) throws Exception {
-        RecyclableArrayList out = RecyclableArrayList.newInstance();
+        CodecOutputList out = CodecOutputList.newInstance();
         try {
-            if (cumulation != null) {
-                callDecode(ctx, cumulation, out);
-                decodeLast(ctx, cumulation, out);
-            } else {
-                decodeLast(ctx, Unpooled.EMPTY_BUFFER, out);
-            }
+            channelInputClosed(ctx, out);
         } catch (DecoderException e) {
             throw e;
         } catch (Exception e) {
@@ -349,9 +360,22 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
                     ctx.fireChannelInactive();
                 }
             } finally {
-                // recycle in all cases
+                // Recycle in all cases
                 out.recycle();
             }
+        }
+    }
+
+    /**
+     * Called when the input of the channel was closed which may be because it changed to inactive or because of
+     * {@link ChannelInputShutdownEvent}.
+     */
+    void channelInputClosed(ChannelHandlerContext ctx, List<Object> out) throws Exception {
+        if (cumulation != null) {
+            callDecode(ctx, cumulation, out);
+            decodeLast(ctx, cumulation, out);
+        } else {
+            decodeLast(ctx, Unpooled.EMPTY_BUFFER, out);
         }
     }
 
@@ -439,7 +463,11 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
      * override this for some special cleanup operation.
      */
     protected void decodeLast(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
-        decode(ctx, in, out);
+        if (in.isReadable()) {
+            // Only call decode() if there is something left in the buffer to decode.
+            // See https://github.com/netty/netty/issues/4386
+            decode(ctx, in, out);
+        }
     }
 
     static ByteBuf expandCumulation(ByteBufAllocator alloc, ByteBuf cumulation, int readable) {

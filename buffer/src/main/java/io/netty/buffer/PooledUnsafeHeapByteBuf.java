@@ -1,7 +1,9 @@
 /*
  * Copyright 2015 The Netty Project
  *
- * The Netty Project licenses this file tothe License at:
+ * The Netty Project licenses this file to you under the Apache License,
+ * version 2.0 (the "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at:
  *
  *   http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -92,6 +94,35 @@ final class PooledUnsafeHeapByteBuf extends PooledHeapByteBuf {
     }
 
     @Override
+    public ByteBuf setZero(int index, int length) {
+        if (PlatformDependent.javaVersion() >= 7) {
+            // Only do on java7+ as the needed Unsafe call was only added there.
+            _setZero(index, length);
+            return this;
+        }
+        return super.setZero(index, length);
+    }
+
+    @Override
+    public ByteBuf writeZero(int length) {
+        if (PlatformDependent.javaVersion() >= 7) {
+            // Only do on java7+ as the needed Unsafe call was only added there.
+            ensureWritable(length);
+            int wIndex = writerIndex;
+            _setZero(wIndex, length);
+            writerIndex = wIndex + length;
+            return this;
+        }
+        return super.writeZero(length);
+    }
+
+    private void _setZero(int index, int length) {
+        checkIndex(index, length);
+        UnsafeByteBufUtil.setZero(memory, idx(index), length);
+    }
+
+    @Override
+    @Deprecated
     protected SwappedByteBuf newSwappedByteBuf() {
         if (PlatformDependent.isUnaligned()) {
             // Only use if unaligned access is supported otherwise there is no gain.

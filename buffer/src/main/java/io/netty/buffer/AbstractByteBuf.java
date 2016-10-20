@@ -17,6 +17,7 @@ package io.netty.buffer;
 
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ResourceLeakDetector;
+import io.netty.util.ResourceLeakDetectorFactory;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.SystemPropertyUtil;
@@ -49,7 +50,8 @@ public abstract class AbstractByteBuf extends ByteBuf {
         }
     }
 
-    static final ResourceLeakDetector<ByteBuf> leakDetector = new ResourceLeakDetector<ByteBuf>(ByteBuf.class);
+    static final ResourceLeakDetector<ByteBuf> leakDetector =
+            ResourceLeakDetectorFactory.instance().newResourceLeakDetector(ByteBuf.class);
 
     int readerIndex;
     int writerIndex;
@@ -674,8 +676,7 @@ public abstract class AbstractByteBuf extends ByteBuf {
             return Unpooled.EMPTY_BUFFER;
         }
 
-        // Use an unpooled heap buffer because there's no way to mandate a user to free the returned buffer.
-        ByteBuf buf = Unpooled.buffer(length, maxCapacity);
+        ByteBuf buf = alloc().buffer(length, maxCapacity);
         buf.writeBytes(this, readerIndex, length);
         readerIndex += length;
         return buf;
@@ -1005,39 +1006,31 @@ public abstract class AbstractByteBuf extends ByteBuf {
 
     @Override
     public int forEachByte(ByteBufProcessor processor) {
-        int index = readerIndex;
-        int length = writerIndex - index;
         ensureAccessible();
-        return forEachByteAsc0(index, length, processor);
+        try {
+            return forEachByteAsc0(readerIndex, writerIndex, processor);
+        } catch (Exception e) {
+            PlatformDependent.throwException(e);
+            return -1;
+        }
     }
 
     @Override
     public int forEachByte(int index, int length, ByteBufProcessor processor) {
         checkIndex(index, length);
-        return forEachByteAsc0(index, length, processor);
-    }
-
-    private int forEachByteAsc0(int index, int length, ByteBufProcessor processor) {
-        if (processor == null) {
-            throw new NullPointerException("processor");
-        }
-
-        if (length == 0) {
-            return -1;
-        }
-
-        final int endIndex = index + length;
-        int i = index;
         try {
-            do {
-                if (processor.process(_getByte(i))) {
-                    i ++;
-                } else {
-                    return i;
-                }
-            } while (i < endIndex);
+            return forEachByteAsc0(index, index + length, processor);
         } catch (Exception e) {
             PlatformDependent.throwException(e);
+            return -1;
+        }
+    }
+
+    private int forEachByteAsc0(int start, int end, ByteBufProcessor processor) throws Exception {
+        for (; start < end; ++start) {
+            if (!processor.process(_getByte(start))) {
+                return start;
+            }
         }
 
         return -1;
@@ -1045,42 +1038,32 @@ public abstract class AbstractByteBuf extends ByteBuf {
 
     @Override
     public int forEachByteDesc(ByteBufProcessor processor) {
-        int index = readerIndex;
-        int length = writerIndex - index;
         ensureAccessible();
-        return forEachByteDesc0(index, length, processor);
+        try {
+            return forEachByteDesc0(writerIndex - 1, readerIndex, processor);
+        } catch (Exception e) {
+            PlatformDependent.throwException(e);
+            return -1;
+        }
     }
 
     @Override
     public int forEachByteDesc(int index, int length, ByteBufProcessor processor) {
         checkIndex(index, length);
-
-        return forEachByteDesc0(index, length, processor);
-    }
-
-    private int forEachByteDesc0(int index, int length, ByteBufProcessor processor) {
-
-        if (processor == null) {
-            throw new NullPointerException("processor");
-        }
-
-        if (length == 0) {
-            return -1;
-        }
-
-        int i = index + length - 1;
         try {
-            do {
-                if (processor.process(_getByte(i))) {
-                    i --;
-                } else {
-                    return i;
-                }
-            } while (i >= index);
+            return forEachByteDesc0(index + length - 1, index, processor);
         } catch (Exception e) {
             PlatformDependent.throwException(e);
+            return -1;
         }
+    }
 
+    private int forEachByteDesc0(int rStart, final int rEnd, ByteBufProcessor processor) throws Exception {
+        for (; rStart >= rEnd; --rStart) {
+            if (!processor.process(_getByte(rStart))) {
+                return rStart;
+            }
+        }
         return -1;
     }
 

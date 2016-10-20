@@ -20,7 +20,7 @@
   <parent>
     <groupId>io.netty</groupId>
     <artifactId>netty-parent</artifactId>
-    <version>4.0.35.Final-SNAPSHOT</version>
+    <version>4.0.43.Final-SNAPSHOT</version>
   </parent>
 
   <artifactId>netty-microbench</artifactId>
@@ -47,12 +47,12 @@
     <dependency>
       <groupId>org.openjdk.jmh</groupId>
       <artifactId>jmh-core</artifactId>
-      <version>1.11.1</version>
+      <version>1.14.1</version>
     </dependency>
     <dependency>
       <groupId>org.openjdk.jmh</groupId>
       <artifactId>jmh-generator-annprocess</artifactId>
-      <version>1.11.1</version>
+      <version>1.14.1</version>
       <scope>provided</scope>
     </dependency>
   </dependencies>
@@ -73,9 +73,9 @@
             <exclude>**/AbstractMicrobenchmark.java</exclude>
             <exclude>**/*$*.class</exclude>
           </excludes>
-            <systemPropertyVariables>
-                <perfReportDir>${project.build.directory}/reports/performance/</perfReportDir>
-            </systemPropertyVariables>
+          <systemPropertyVariables>
+            <perfReportDir>${project.build.directory}/reports/performance/</perfReportDir>
+          </systemPropertyVariables>
         </configuration>
       </plugin>
     </plugins>

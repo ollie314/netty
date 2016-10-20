@@ -20,6 +20,14 @@ import io.netty.util.internal.chmv8.ConcurrentHashMapV8;
 import io.netty.util.internal.chmv8.LongAdderV8;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
+import org.jctools.queues.MpscArrayQueue;
+import org.jctools.queues.MpscChunkedArrayQueue;
+import org.jctools.queues.SpscLinkedQueue;
+import org.jctools.queues.atomic.MpscAtomicArrayQueue;
+import org.jctools.queues.atomic.MpscLinkedAtomicQueue;
+import org.jctools.queues.atomic.SpscLinkedAtomicQueue;
+import org.jctools.util.Pow2;
+import org.jctools.util.UnsafeAccess;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -31,17 +39,17 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Queue;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -73,11 +81,17 @@ public final class PlatformDependent {
 
     private static final boolean CAN_ENABLE_TCP_NODELAY_BY_DEFAULT = !isAndroid();
 
+    private static final boolean IS_EXPLICIT_NO_UNSAFE = explicitNoUnsafe0();
     private static final boolean HAS_UNSAFE = hasUnsafe0();
     private static final boolean CAN_USE_CHM_V8 = HAS_UNSAFE && JAVA_VERSION < 8;
     private static final boolean DIRECT_BUFFER_PREFERRED =
             HAS_UNSAFE && !SystemPropertyUtil.getBoolean("io.netty.noPreferDirect", false);
     private static final long MAX_DIRECT_MEMORY = maxDirectMemory0();
+
+    private static final int MPSC_CHUNK_SIZE =  1024;
+    private static final int MIN_MAX_MPSC_CAPACITY =  MPSC_CHUNK_SIZE * 2;
+    private static final int DEFAULT_MAX_MPSC_CAPACITY =  MPSC_CHUNK_SIZE * MPSC_CHUNK_SIZE;
+    private static final int MAX_ALLOWED_MPSC_CAPACITY = Pow2.MAX_POW2;
 
     private static final long ARRAY_BASE_OFFSET = arrayBaseOffset0();
 
@@ -88,18 +102,51 @@ public final class PlatformDependent {
     private static final int BIT_MODE = bitMode0();
 
     private static final int ADDRESS_SIZE = addressSize0();
+    private static final boolean USE_DIRECT_BUFFER_NO_CLEANER;
+    private static final AtomicLong DIRECT_MEMORY_COUNTER;
+    private static final long DIRECT_MEMORY_LIMIT;
+
+    public static final boolean BIG_ENDIAN_NATIVE_ORDER = ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
 
     static {
         if (logger.isDebugEnabled()) {
             logger.debug("-Dio.netty.noPreferDirect: {}", !DIRECT_BUFFER_PREFERRED);
         }
 
-        if (!hasUnsafe() && !isAndroid()) {
+        if (!hasUnsafe() && !isAndroid() && !IS_EXPLICIT_NO_UNSAFE) {
             logger.info(
                     "Your platform does not provide complete low-level API for accessing direct buffers reliably. " +
                     "Unless explicitly requested, heap buffer will always be preferred to avoid potential system " +
                     "unstability.");
         }
+
+        // Here is how the system property is used:
+        //
+        // * <  0  - Don't use cleaner, and inherit max direct memory from java. In this case the
+        //           "practical max direct memory" would be 2 * max memory as defined by the JDK.
+        // * == 0  - Use cleaner, Netty will not enforce max memory, and instead will defer to JDK.
+        // * >  0  - Don't use cleaner. This will limit Netty's total direct memory
+        //           (note: that JDK's direct memory limit is independent of this).
+        long maxDirectMemory = SystemPropertyUtil.getLong("io.netty.maxDirectMemory", -1);
+
+        if (maxDirectMemory == 0 || !hasUnsafe() || !PlatformDependent0.hasDirectBufferNoCleanerConstructor()) {
+            USE_DIRECT_BUFFER_NO_CLEANER = false;
+            DIRECT_MEMORY_COUNTER = null;
+        } else {
+            USE_DIRECT_BUFFER_NO_CLEANER = true;
+            if (maxDirectMemory < 0) {
+                maxDirectMemory = maxDirectMemory0();
+                if (maxDirectMemory <= 0) {
+                    DIRECT_MEMORY_COUNTER = null;
+                } else {
+                    DIRECT_MEMORY_COUNTER = new AtomicLong();
+                }
+            } else {
+                DIRECT_MEMORY_COUNTER = new AtomicLong();
+            }
+        }
+        DIRECT_MEMORY_LIMIT = maxDirectMemory;
+        logger.debug("io.netty.maxDirectMemory: {} bytes", maxDirectMemory);
     }
 
     /**
@@ -313,6 +360,14 @@ public final class PlatformDependent {
         return PlatformDependent0.directBufferAddress(buffer);
     }
 
+    public static ByteBuffer directBuffer(long memoryAddress, int size) {
+        if (PlatformDependent0.hasDirectBufferNoCleanerConstructor()) {
+            return PlatformDependent0.newDirectBuffer(memoryAddress, size);
+        }
+        throw new UnsupportedOperationException(
+                "sun.misc.Unsafe or java.nio.DirectByteBuffer.<init>(long, int) not available");
+    }
+
     public static Object getObject(Object object, long fieldOffset) {
         return PlatformDependent0.getObject(object, fieldOffset);
     }
@@ -409,6 +464,88 @@ public final class PlatformDependent {
         PlatformDependent0.copyMemory(null, srcAddr, dst, ARRAY_BASE_OFFSET + dstIndex, length);
     }
 
+    public static void setMemory(byte[] dst, int dstIndex, long bytes, byte value) {
+        PlatformDependent0.setMemory(dst, ARRAY_BASE_OFFSET + dstIndex, bytes, value);
+    }
+
+    public static void setMemory(long address, long bytes, byte value) {
+        PlatformDependent0.setMemory(address, bytes, value);
+    }
+
+    /**
+     * Allocate a new {@link ByteBuffer} with the given {@code capacity}. {@link ByteBuffer}s allocated with
+     * this method <strong>MUST</strong> be deallocated via {@link #freeDirectNoCleaner(ByteBuffer)}.
+     */
+    public static ByteBuffer allocateDirectNoCleaner(int capacity) {
+        assert USE_DIRECT_BUFFER_NO_CLEANER;
+
+        incrementMemoryCounter(capacity);
+        try {
+            return PlatformDependent0.allocateDirectNoCleaner(capacity);
+        } catch (Throwable e) {
+            decrementMemoryCounter(capacity);
+            throwException(e);
+            return null;
+        }
+    }
+
+    /**
+     * Reallocate a new {@link ByteBuffer} with the given {@code capacity}. {@link ByteBuffer}s reallocated with
+     * this method <strong>MUST</strong> be deallocated via {@link #freeDirectNoCleaner(ByteBuffer)}.
+     */
+    public static ByteBuffer reallocateDirectNoCleaner(ByteBuffer buffer, int capacity) {
+        assert USE_DIRECT_BUFFER_NO_CLEANER;
+
+        int len = capacity - buffer.capacity();
+        incrementMemoryCounter(len);
+        try {
+            return PlatformDependent0.reallocateDirectNoCleaner(buffer, capacity);
+        } catch (Throwable e) {
+            decrementMemoryCounter(len);
+            throwException(e);
+            return null;
+        }
+    }
+
+    /**
+     * This method <strong>MUST</strong> only be called for {@link ByteBuffer}s that were allocated via
+     * {@link #allocateDirectNoCleaner(int)}.
+     */
+    public static void freeDirectNoCleaner(ByteBuffer buffer) {
+        assert USE_DIRECT_BUFFER_NO_CLEANER;
+
+        int capacity = buffer.capacity();
+        PlatformDependent0.freeMemory(PlatformDependent0.directBufferAddress(buffer));
+        decrementMemoryCounter(capacity);
+    }
+
+    private static void incrementMemoryCounter(int capacity) {
+        if (DIRECT_MEMORY_COUNTER != null) {
+            for (;;) {
+                long usedMemory = DIRECT_MEMORY_COUNTER.get();
+                long newUsedMemory = usedMemory + capacity;
+                if (newUsedMemory > DIRECT_MEMORY_LIMIT) {
+                    throw new OutOfDirectMemoryError("failed to allocate " + capacity
+                            + " byte(s) of direct memory (used: " + usedMemory + ", max: " + DIRECT_MEMORY_LIMIT + ')');
+                }
+                if (DIRECT_MEMORY_COUNTER.compareAndSet(usedMemory, newUsedMemory)) {
+                    break;
+                }
+            }
+        }
+    }
+
+    private static void decrementMemoryCounter(int capacity) {
+        if (DIRECT_MEMORY_COUNTER != null) {
+            long usedMemory = DIRECT_MEMORY_COUNTER.addAndGet(-capacity);
+            assert usedMemory >= 0;
+        }
+    }
+
+    public static boolean useDirectBufferNoCleaner() {
+        return USE_DIRECT_BUFFER_NO_CLEANER;
+    }
+
     /**
      * Create a new optimized {@link AtomicReferenceFieldUpdater} or {@code null} if it
      * could not be created. Because of this the caller need to check for {@code null} and if {@code null} is returned
@@ -460,12 +597,72 @@ public final class PlatformDependent {
         return null;
     }
 
+    private static final class Mpsc {
+        private static final boolean USE_MPSC_CHUNKED_ARRAY_QUEUE;
+
+        private Mpsc() {
+        }
+
+        static {
+            Object unsafe = null;
+            if (hasUnsafe()) {
+                // jctools goes through its own process of initializing unsafe; of
+                // course, this requires permissions which might not be granted to calling code, so we
+                // must mark this block as privileged too
+                unsafe = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+                    @Override
+                    public Object run() {
+                        // force JCTools to initialize unsafe
+                        return UnsafeAccess.UNSAFE;
+                    }
+                });
+            }
+
+            if (unsafe == null) {
+                logger.debug("org.jctools-core.MpscChunkedArrayQueue: unavailable");
+                USE_MPSC_CHUNKED_ARRAY_QUEUE = false;
+            } else {
+                logger.debug("org.jctools-core.MpscChunkedArrayQueue: available");
+                USE_MPSC_CHUNKED_ARRAY_QUEUE = true;
+            }
+        }
+
+        static <T> Queue<T> newMpscQueue(final int maxCapacity) {
+            if (USE_MPSC_CHUNKED_ARRAY_QUEUE) {
+                // Calculate the max capacity which can not be bigger then MAX_ALLOWED_MPSC_CAPACITY.
+                // This is forced by the MpscChunkedArrayQueue implementation as will try to round it
+                // up to the next power of two and so will overflow otherwise.
+                final int capacity =
+                        Math.max(Math.min(maxCapacity, MAX_ALLOWED_MPSC_CAPACITY), MIN_MAX_MPSC_CAPACITY);
+                return new MpscChunkedArrayQueue<T>(MPSC_CHUNK_SIZE, capacity, true);
+            } else {
+                return new MpscLinkedAtomicQueue<T>();
+            }
+        }
+    }
+
     /**
      * Create a new {@link Queue} which is safe to use for multiple producers (different threads) and a single
      * consumer (one thread!).
      */
     public static <T> Queue<T> newMpscQueue() {
-        return new MpscLinkedQueue<T>();
+        return newMpscQueue(DEFAULT_MAX_MPSC_CAPACITY);
+    }
+
+    /**
+     * Create a new {@link Queue} which is safe to use for multiple producers (different threads) and a single
+     * consumer (one thread!).
+     */
+    public static <T> Queue<T> newMpscQueue(final int maxCapacity) {
+        return Mpsc.newMpscQueue(maxCapacity);
+    }
+
+    /**
+     * Create a new {@link Queue} which is safe to use for single producer (one thread!) and a single
+     * consumer (one thread!).
+     */
+    public static <T> Queue<T> newSpscQueue() {
+        return hasUnsafe() ? new SpscLinkedQueue<T>() : new SpscLinkedAtomicQueue<T>();
     }
 
     /**
@@ -473,11 +670,7 @@ public final class PlatformDependent {
      * consumer (one thread!) with the given fixes {@code capacity}.
      */
     public static <T> Queue<T> newFixedMpscQueue(int capacity) {
-        if (hasUnsafe()) {
-            return new MpscArrayQueue<T>(capacity);
-        } else {
-            return new LinkedBlockingQueue<T>(capacity);
-        }
+        return hasUnsafe() ? new MpscArrayQueue<T>(capacity) : new MpscAtomicArrayQueue<T>(capacity);
     }
 
     /**
@@ -629,56 +822,57 @@ public final class PlatformDependent {
         return false;
     }
 
-    @SuppressWarnings("LoopStatementThatDoesntLoop")
     private static int javaVersion0() {
-        int javaVersion;
-
-        // Not really a loop
-        for (;;) {
-            // Android
-            if (isAndroid()) {
-                javaVersion = 6;
-                break;
-            }
-
-            try {
-                Class.forName("java.time.Clock", false, getClassLoader(Object.class));
-                javaVersion = 8;
-                break;
-            } catch (Throwable ignored) {
-                // Ignore
-            }
-
-            try {
-                Class.forName("java.util.concurrent.LinkedTransferQueue", false, getClassLoader(BlockingQueue.class));
-                javaVersion = 7;
-                break;
-            } catch (Throwable ignored) {
-                // Ignore
-            }
-
-            javaVersion = 6;
-            break;
-        }
-
-        if (logger.isDebugEnabled()) {
-            logger.debug("Java version: {}", javaVersion);
-        }
-        return javaVersion;
-    }
-
-    private static boolean hasUnsafe0() {
-        boolean noUnsafe = SystemPropertyUtil.getBoolean("io.netty.noUnsafe", false);
-        logger.debug("-Dio.netty.noUnsafe: {}", noUnsafe);
+        final int majorVersion;
 
         if (isAndroid()) {
-            logger.debug("sun.misc.Unsafe: unavailable (Android)");
-            return false;
+            majorVersion = 6;
+        } else {
+            majorVersion = majorVersionFromJavaSpecificationVersion();
         }
+
+        logger.debug("Java version: {}", majorVersion);
+
+        return majorVersion;
+    }
+
+    static int majorVersionFromJavaSpecificationVersion() {
+        try {
+            final String javaSpecVersion = AccessController.doPrivileged(new PrivilegedAction<String>() {
+                @Override
+                public String run() {
+                    return System.getProperty("java.specification.version");
+                }
+            });
+            return majorVersion(javaSpecVersion);
+        } catch (SecurityException e) {
+            logger.debug("security exception while reading java.specification.version", e);
+            return 6;
+        }
+    }
+
+    static int majorVersion(final String javaSpecVersion) {
+        final String[] components = javaSpecVersion.split("\\.");
+        final int[] version = new int[components.length];
+        for (int i = 0; i < components.length; i++) {
+            version[i] = Integer.parseInt(components[i]);
+        }
+
+        if (version[0] == 1) {
+            assert version[1] >= 6;
+            return version[1];
+        } else {
+            return version[0];
+        }
+    }
+
+    private static boolean explicitNoUnsafe0() {
+        final boolean noUnsafe = SystemPropertyUtil.getBoolean("io.netty.noUnsafe", false);
+        logger.debug("-Dio.netty.noUnsafe: {}", noUnsafe);
 
         if (noUnsafe) {
             logger.debug("sun.misc.Unsafe: unavailable (io.netty.noUnsafe)");
-            return false;
+            return true;
         }
 
         // Legacy properties
@@ -691,6 +885,19 @@ public final class PlatformDependent {
 
         if (!tryUnsafe) {
             logger.debug("sun.misc.Unsafe: unavailable (io.netty.tryUnsafe/org.jboss.netty.tryUnsafe)");
+            return true;
+        }
+
+        return false;
+    }
+
+    private static boolean hasUnsafe0() {
+        if (isAndroid()) {
+            logger.debug("sun.misc.Unsafe: unavailable (Android)");
+            return false;
+        }
+
+        if (IS_EXPLICIT_NO_UNSAFE) {
             return false;
         }
 

@@ -15,12 +15,15 @@
  */
 package io.netty.channel.nio;
 
-
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelException;
+import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopException;
+import io.netty.channel.SelectStrategy;
 import io.netty.channel.SingleThreadEventLoop;
 import io.netty.channel.nio.AbstractNioChannel.NioUnsafe;
+import io.netty.util.IntSupplier;
+import io.netty.util.concurrent.RejectedExecutionHandler;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
@@ -33,6 +36,8 @@ import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.spi.SelectorProvider;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.ConcurrentModificationException;
@@ -40,6 +45,7 @@ import java.util.Iterator;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -60,21 +66,38 @@ public final class NioEventLoop extends SingleThreadEventLoop {
     private static final int MIN_PREMATURE_SELECTOR_RETURNS = 3;
     private static final int SELECTOR_AUTO_REBUILD_THRESHOLD;
 
+    private final IntSupplier selectNowSupplier = new IntSupplier() {
+        @Override
+        public int get() throws Exception {
+            return selectNow();
+        }
+    };
+    private final Callable<Integer> pendingTasksCallable = new Callable<Integer>() {
+        @Override
+        public Integer call() throws Exception {
+            return NioEventLoop.super.pendingTasks();
+        }
+    };
+
     // Workaround for JDK NIO bug.
     //
     // See:
     // - http://bugs.sun.com/view_bug.do?bug_id=6427854
     // - https://github.com/netty/netty/issues/203
     static {
-        String key = "sun.nio.ch.bugLevel";
-        try {
-            String buglevel = SystemPropertyUtil.get(key);
-            if (buglevel == null) {
-                System.setProperty(key, "");
-            }
-        } catch (SecurityException e) {
-            if (logger.isDebugEnabled()) {
-                logger.debug("Unable to get/set System Property: {}", key, e);
+        final String key = "sun.nio.ch.bugLevel";
+        final String buglevel = SystemPropertyUtil.get(key);
+        if (buglevel == null) {
+            try {
+                AccessController.doPrivileged(new PrivilegedAction<Void>() {
+                    @Override
+                    public Void run() {
+                        System.setProperty(key, "");
+                        return null;
+                    }
+                });
+            } catch (final SecurityException e) {
+                logger.debug("Unable to get/set System Property: " + key, e);
             }
         }
 
@@ -107,17 +130,24 @@ public final class NioEventLoop extends SingleThreadEventLoop {
      */
     private final AtomicBoolean wakenUp = new AtomicBoolean();
 
+    private final SelectStrategy selectStrategy;
+
     private volatile int ioRatio = 50;
     private int cancelledKeys;
     private boolean needsToSelectAgain;
 
-    NioEventLoop(NioEventLoopGroup parent, ThreadFactory threadFactory, SelectorProvider selectorProvider) {
-        super(parent, threadFactory, false);
+    NioEventLoop(NioEventLoopGroup parent, ThreadFactory threadFactory, SelectorProvider selectorProvider,
+                 SelectStrategy strategy, RejectedExecutionHandler rejectedExecutionHandler) {
+        super(parent, threadFactory, false, DEFAULT_MAX_PENDING_TASKS, rejectedExecutionHandler);
         if (selectorProvider == null) {
             throw new NullPointerException("selectorProvider");
         }
+        if (strategy == null) {
+            throw new NullPointerException("selectStrategy");
+        }
         provider = selectorProvider;
         selector = openSelector();
+        selectStrategy = strategy;
     }
 
     private Selector openSelector() {
@@ -132,40 +162,101 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             return selector;
         }
 
-        try {
-            SelectedSelectionKeySet selectedKeySet = new SelectedSelectionKeySet();
+        final SelectedSelectionKeySet selectedKeySet = new SelectedSelectionKeySet();
 
-            Class<?> selectorImplClass =
-                    Class.forName("sun.nio.ch.SelectorImpl", false, PlatformDependent.getSystemClassLoader());
-
-            // Ensure the current selector implementation is what we can instrument.
-            if (!selectorImplClass.isAssignableFrom(selector.getClass())) {
-                return selector;
+        Object maybeSelectorImplClass = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+            @Override
+            public Object run() {
+                try {
+                    return Class.forName(
+                            "sun.nio.ch.SelectorImpl",
+                            false,
+                            PlatformDependent.getSystemClassLoader());
+                } catch (ClassNotFoundException e) {
+                    return e;
+                } catch (SecurityException e) {
+                    return e;
+                }
             }
+        });
 
-            Field selectedKeysField = selectorImplClass.getDeclaredField("selectedKeys");
-            Field publicSelectedKeysField = selectorImplClass.getDeclaredField("publicSelectedKeys");
+        if (!(maybeSelectorImplClass instanceof Class) ||
+                // ensure the current selector implementation is what we can instrument.
+                !((Class<?>) maybeSelectorImplClass).isAssignableFrom(selector.getClass())) {
+            if (maybeSelectorImplClass instanceof Exception) {
+                Exception e = (Exception) maybeSelectorImplClass;
+                logger.trace("failed to instrument a special java.util.Set into: {}", selector, e);
+            }
+            return selector;
+        }
 
-            selectedKeysField.setAccessible(true);
-            publicSelectedKeysField.setAccessible(true);
+        final Class<?> selectorImplClass = (Class<?>) maybeSelectorImplClass;
 
-            selectedKeysField.set(selector, selectedKeySet);
-            publicSelectedKeysField.set(selector, selectedKeySet);
+        Object maybeException = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+            @Override
+            public Object run() {
+                try {
+                    Field selectedKeysField = selectorImplClass.getDeclaredField("selectedKeys");
+                    Field publicSelectedKeysField = selectorImplClass.getDeclaredField("publicSelectedKeys");
 
-            selectedKeys = selectedKeySet;
-            logger.trace("Instrumented an optimized java.util.Set into: {}", selector);
-        } catch (Throwable t) {
+                    selectedKeysField.setAccessible(true);
+                    publicSelectedKeysField.setAccessible(true);
+
+                    selectedKeysField.set(selector, selectedKeySet);
+                    publicSelectedKeysField.set(selector, selectedKeySet);
+                    return null;
+                } catch (NoSuchFieldException e) {
+                    return e;
+                } catch (IllegalAccessException e) {
+                    return e;
+                } catch (RuntimeException e) {
+                    // JDK 9 can throw an inaccessible object exception here; since Netty compiles
+                    // against JDK 7 and this exception was only added in JDK 9, we have to weakly
+                    // check the type
+                    if ("java.lang.reflect.InaccessibleObjectException".equals(e.getClass().getName())) {
+                        return e;
+                    } else {
+                        throw e;
+                    }
+                }
+            }
+        });
+
+        if (maybeException instanceof Exception) {
             selectedKeys = null;
-            logger.trace("Failed to instrument an optimized java.util.Set into: {}", selector, t);
+            Exception e = (Exception) maybeException;
+            logger.trace("failed to instrument a special java.util.Set into: {}", selector, e);
+        } else {
+            selectedKeys = selectedKeySet;
+            logger.trace("instrumented a special java.util.Set into: {}", selector);
         }
 
         return selector;
     }
 
+    /**
+     * Returns the {@link SelectorProvider} used by this {@link NioEventLoop} to obtain the {@link Selector}.
+     */
+    public SelectorProvider selectorProvider() {
+        return provider;
+    }
+
     @Override
-    protected Queue<Runnable> newTaskQueue() {
+    protected Queue<Runnable> newTaskQueue(int maxPendingTasks) {
         // This event loop never calls takeTask()
-        return PlatformDependent.newMpscQueue();
+        return PlatformDependent.newMpscQueue(maxPendingTasks);
+    }
+
+    @Override
+    public int pendingTasks() {
+        // As we use a MpscQueue we need to ensure pendingTasks() is only executed from within the EventLoop as
+        // otherwise we may see unexpected behavior (as size() is only allowed to be called by a single consumer).
+        // See https://github.com/netty/netty/issues/5297
+        if (inEventLoop()) {
+            return super.pendingTasks();
+        } else {
+            return submit(pendingTasksCallable).syncUninterruptibly().getNow();
+        }
     }
 
     /**
@@ -302,78 +393,94 @@ public final class NioEventLoop extends SingleThreadEventLoop {
     @Override
     protected void run() {
         for (;;) {
-            boolean oldWakenUp = wakenUp.getAndSet(false);
             try {
-                if (hasTasks()) {
-                    selectNow();
-                } else {
-                    select(oldWakenUp);
+                switch (selectStrategy.calculateStrategy(selectNowSupplier, hasTasks())) {
+                    case SelectStrategy.CONTINUE:
+                        continue;
+                    case SelectStrategy.SELECT:
+                        select(wakenUp.getAndSet(false));
 
-                    // 'wakenUp.compareAndSet(false, true)' is always evaluated
-                    // before calling 'selector.wakeup()' to reduce the wake-up
-                    // overhead. (Selector.wakeup() is an expensive operation.)
-                    //
-                    // However, there is a race condition in this approach.
-                    // The race condition is triggered when 'wakenUp' is set to
-                    // true too early.
-                    //
-                    // 'wakenUp' is set to true too early if:
-                    // 1) Selector is waken up between 'wakenUp.set(false)' and
-                    //    'selector.select(...)'. (BAD)
-                    // 2) Selector is waken up between 'selector.select(...)' and
-                    //    'if (wakenUp.get()) { ... }'. (OK)
-                    //
-                    // In the first case, 'wakenUp' is set to true and the
-                    // following 'selector.select(...)' will wake up immediately.
-                    // Until 'wakenUp' is set to false again in the next round,
-                    // 'wakenUp.compareAndSet(false, true)' will fail, and therefore
-                    // any attempt to wake up the Selector will fail, too, causing
-                    // the following 'selector.select(...)' call to block
-                    // unnecessarily.
-                    //
-                    // To fix this problem, we wake up the selector again if wakenUp
-                    // is true immediately after selector.select(...).
-                    // It is inefficient in that it wakes up the selector for both
-                    // the first case (BAD - wake-up required) and the second case
-                    // (OK - no wake-up required).
+                        // 'wakenUp.compareAndSet(false, true)' is always evaluated
+                        // before calling 'selector.wakeup()' to reduce the wake-up
+                        // overhead. (Selector.wakeup() is an expensive operation.)
+                        //
+                        // However, there is a race condition in this approach.
+                        // The race condition is triggered when 'wakenUp' is set to
+                        // true too early.
+                        //
+                        // 'wakenUp' is set to true too early if:
+                        // 1) Selector is waken up between 'wakenUp.set(false)' and
+                        //    'selector.select(...)'. (BAD)
+                        // 2) Selector is waken up between 'selector.select(...)' and
+                        //    'if (wakenUp.get()) { ... }'. (OK)
+                        //
+                        // In the first case, 'wakenUp' is set to true and the
+                        // following 'selector.select(...)' will wake up immediately.
+                        // Until 'wakenUp' is set to false again in the next round,
+                        // 'wakenUp.compareAndSet(false, true)' will fail, and therefore
+                        // any attempt to wake up the Selector will fail, too, causing
+                        // the following 'selector.select(...)' call to block
+                        // unnecessarily.
+                        //
+                        // To fix this problem, we wake up the selector again if wakenUp
+                        // is true immediately after selector.select(...).
+                        // It is inefficient in that it wakes up the selector for both
+                        // the first case (BAD - wake-up required) and the second case
+                        // (OK - no wake-up required).
 
-                    if (wakenUp.get()) {
-                        selector.wakeup();
-                    }
+                        if (wakenUp.get()) {
+                            selector.wakeup();
+                        }
+                    default:
+                        // fallthrough
                 }
 
                 cancelledKeys = 0;
                 needsToSelectAgain = false;
                 final int ioRatio = this.ioRatio;
                 if (ioRatio == 100) {
-                    processSelectedKeys();
-                    runAllTasks();
+                    try {
+                        processSelectedKeys();
+                    } finally {
+                        // Ensure we always run tasks.
+                        runAllTasks();
+                    }
                 } else {
                     final long ioStartTime = System.nanoTime();
-
-                    processSelectedKeys();
-
-                    final long ioTime = System.nanoTime() - ioStartTime;
-                    runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
-                }
-
-                if (isShuttingDown()) {
-                    closeAll();
-                    if (confirmShutdown()) {
-                        break;
+                    try {
+                        processSelectedKeys();
+                    } finally {
+                        // Ensure we always run tasks.
+                        final long ioTime = System.nanoTime() - ioStartTime;
+                        runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
                     }
                 }
             } catch (Throwable t) {
-                logger.warn("Unexpected exception in the selector loop.", t);
-
-                // Prevent possible consecutive immediate failures that lead to
-                // excessive CPU consumption.
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {
-                    // Ignore.
-                }
+                handleLoopException(t);
             }
+            // Always handle shutdown even if the loop processing threw an exception.
+            try {
+                if (isShuttingDown()) {
+                    closeAll();
+                    if (confirmShutdown()) {
+                        return;
+                    }
+                }
+            } catch (Throwable t) {
+                handleLoopException(t);
+            }
+        }
+    }
+
+    private static void handleLoopException(Throwable t) {
+        logger.warn("Unexpected exception in the selector loop.", t);
+
+        // Prevent possible consecutive immediate failures that lead to
+        // excessive CPU consumption.
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+            // Ignore.
         }
     }
 
@@ -495,9 +602,25 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         }
     }
 
-    private static void processSelectedKey(SelectionKey k, AbstractNioChannel ch) {
+    private void processSelectedKey(SelectionKey k, AbstractNioChannel ch) {
         final NioUnsafe unsafe = ch.unsafe();
         if (!k.isValid()) {
+            final EventLoop eventLoop;
+            try {
+                eventLoop = ch.eventLoop();
+            } catch (Throwable ignored) {
+                // If the channel implementation throws an exception because there is no event loop, we ignore this
+                // because we are only trying to determine if ch is registered to this event loop and thus has authority
+                // to close ch.
+                return;
+            }
+            // Only close ch if ch is still registerd to this EventLoop. ch could have deregistered from the event loop
+            // and thus the SelectionKey could be cancelled as part of the deregistration process, but the channel is
+            // still healthy and should not be closed.
+            // See https://github.com/netty/netty/issues/5125
+            if (eventLoop != this || eventLoop == null) {
+                return;
+            }
             // close the channel if the key is not valid anymore
             unsafe.close(unsafe.voidPromise());
             return;
@@ -505,19 +628,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
         try {
             int readyOps = k.readyOps();
-            // Also check for readOps of 0 to workaround possible JDK bug which may otherwise lead
-            // to a spin loop
-            if ((readyOps & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0 || readyOps == 0) {
-                unsafe.read();
-                if (!ch.isOpen()) {
-                    // Connection already closed - no need to handle write.
-                    return;
-                }
-            }
-            if ((readyOps & SelectionKey.OP_WRITE) != 0) {
-                // Call forceFlush which will also take care of clear the OP_WRITE once there is nothing left to write
-                ch.unsafe().forceFlush();
-            }
+            // We first need to call finishConnect() before try to trigger a read(...) or write(...) as otherwise
+            // the NIO JDK channel implementation may throw a NotYetConnectedException.
             if ((readyOps & SelectionKey.OP_CONNECT) != 0) {
                 // remove OP_CONNECT as otherwise Selector.select(..) will always return without blocking
                 // See https://github.com/netty/netty/issues/924
@@ -526,6 +638,22 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                 k.interestOps(ops);
 
                 unsafe.finishConnect();
+            }
+
+            // Process OP_WRITE first as we may be able to write some queued buffers and so free memory.
+            if ((readyOps & SelectionKey.OP_WRITE) != 0) {
+                // Call forceFlush which will also take care of clear the OP_WRITE once there is nothing left to write
+                ch.unsafe().forceFlush();
+            }
+
+            // Also check for readOps of 0 to workaround possible JDK bug which may otherwise lead
+            // to a spin loop
+            if ((readyOps & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0 || readyOps == 0) {
+                unsafe.read();
+                if (!ch.isOpen()) {
+                    // Connection already closed - no need to handle write.
+                    return;
+                }
             }
         } catch (CancelledKeyException ignored) {
             unsafe.close(unsafe.voidPromise());
@@ -592,9 +720,9 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         }
     }
 
-    void selectNow() throws IOException {
+    int selectNow() throws IOException {
         try {
-            selector.selectNow();
+            return selector.selectNow();
         } finally {
             // restore wakup state if needed
             if (wakenUp.get()) {
@@ -616,6 +744,16 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                         selector.selectNow();
                         selectCnt = 1;
                     }
+                    break;
+                }
+
+                // If a task was submitted when wakenUp value was true, the task didn't get a chance to call
+                // Selector#wakeup. So we need to check task queue again before executing select operation.
+                // If we don't, the task might be pended until select operation was timed out.
+                // It might be pended until idle timeout if IdleStateHandler existed in pipeline.
+                if (hasTasks() && wakenUp.compareAndSet(false, true)) {
+                    selector.selectNow();
+                    selectCnt = 1;
                     break;
                 }
 
@@ -653,8 +791,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                     // The selector returned prematurely many times in a row.
                     // Rebuild the selector to work around the problem.
                     logger.warn(
-                            "Selector.select() returned prematurely {} times in a row; rebuilding selector.",
-                            selectCnt);
+                            "Selector.select() returned prematurely {} times in a row; rebuilding Selector {}.",
+                            selectCnt, selector);
 
                     rebuildSelector();
                     selector = this.selector;
@@ -670,12 +808,14 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
             if (selectCnt > MIN_PREMATURE_SELECTOR_RETURNS) {
                 if (logger.isDebugEnabled()) {
-                    logger.debug("Selector.select() returned prematurely {} times in a row.", selectCnt - 1);
+                    logger.debug("Selector.select() returned prematurely {} times in a row for Selector {}.",
+                            selectCnt - 1, selector);
                 }
             }
         } catch (CancelledKeyException e) {
             if (logger.isDebugEnabled()) {
-                logger.debug(CancelledKeyException.class.getSimpleName() + " raised by a Selector - JDK bug?", e);
+                logger.debug(CancelledKeyException.class.getSimpleName() + " raised by a Selector {} - JDK bug?",
+                        selector, e);
             }
             // Harmless exception - log anyway
         }

@@ -21,6 +21,7 @@ import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.AbstractChannel;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelException;
 import io.netty.channel.ChannelMetadata;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoop;
@@ -28,11 +29,11 @@ import io.netty.channel.socket.ChannelInputShutdownEvent;
 import io.netty.channel.unix.Socket;
 import io.netty.channel.unix.UnixChannel;
 import io.netty.util.ReferenceCountUtil;
-import io.netty.util.internal.OneTimeTask;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.NotYetConnectedException;
 import java.nio.channels.UnresolvedAddressException;
 
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
@@ -55,6 +56,14 @@ abstract class AbstractEpollChannel extends AbstractChannel implements UnixChann
         readFlag = flag;
         flags |= flag;
         this.active = active;
+    }
+
+    static boolean isSoErrorZero(Socket fd) {
+        try {
+            return fd.getSoError() == 0;
+        } catch (IOException e) {
+            throw new ChannelException(e);
+        }
     }
 
     void setFlag(int flag) throws IOException {
@@ -95,21 +104,11 @@ abstract class AbstractEpollChannel extends AbstractChannel implements UnixChann
 
     @Override
     protected void doClose() throws Exception {
-        this.active = false;
-        Socket fd = fileDescriptor;
+        active = false;
         try {
-            // deregister from epoll now and shutdown the socket.
             doDeregister();
-            if (!fd.isShutdown()) {
-                try {
-                    fd().shutdown();
-                } catch (IOException ignored) {
-                    // The FD will be closed, so if shutdown fails there is nothing we can do.
-                }
-            }
         } finally {
-            // Ensure the file descriptor is closed in all cases.
-            fd.close();
+            fileDescriptor.close();
         }
     }
 
@@ -150,7 +149,7 @@ abstract class AbstractEpollChannel extends AbstractChannel implements UnixChann
                 unsafe.clearEpollIn0();
             } else {
                 // schedule a task to clear the EPOLLIN as it is not safe to modify it directly
-                loop.execute(new OneTimeTask() {
+                loop.execute(new Runnable() {
                     @Override
                     public void run() {
                         if (!config().isAutoRead() && !unsafe.readPending) {
@@ -350,17 +349,27 @@ abstract class AbstractEpollChannel extends AbstractChannel implements UnixChann
                     try {
                         fd().shutdown(true, false);
                         clearEpollIn0();
-                        pipeline().fireUserEventTriggered(ChannelInputShutdownEvent.INSTANCE);
                     } catch (IOException ignored) {
                         // We attempted to shutdown and failed, which means the input has already effectively been
                         // shutdown.
-                        pipeline().fireUserEventTriggered(ChannelInputShutdownEvent.INSTANCE);
-                        close(voidPromise());
+                        fireEventAndClose(ChannelInputShutdownEvent.INSTANCE);
+                        return;
+                    } catch (NotYetConnectedException ignore) {
+                        // We attempted to shutdown and failed, which means the input has already effectively been
+                        // shutdown.
+                        fireEventAndClose(ChannelInputShutdownEvent.INSTANCE);
+                        return;
                     }
+                    pipeline().fireUserEventTriggered(ChannelInputShutdownEvent.INSTANCE);
                 } else {
                     close(voidPromise());
                 }
             }
+        }
+
+        private void fireEventAndClose(Object evt) {
+            pipeline().fireUserEventTriggered(evt);
+            close(voidPromise());
         }
 
         @Override

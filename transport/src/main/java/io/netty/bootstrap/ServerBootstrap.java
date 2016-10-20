@@ -28,7 +28,6 @@ import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.ServerChannel;
 import io.netty.util.AttributeKey;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -178,13 +177,23 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
         p.addLast(new ChannelInitializer<Channel>() {
             @Override
             public void initChannel(Channel ch) throws Exception {
-                ChannelPipeline pipeline = ch.pipeline();
+                final ChannelPipeline pipeline = ch.pipeline();
                 ChannelHandler handler = handler();
                 if (handler != null) {
                     pipeline.addLast(handler);
                 }
-                pipeline.addLast(new ServerBootstrapAcceptor(
-                        currentChildGroup, currentChildHandler, currentChildOptions, currentChildAttrs));
+
+                // We add this handler via the EventLoop as the user may have used a ChannelInitializer as handler.
+                // In this case the initChannel(...) method will only be called after this method returns. Because
+                // of this we need to ensure we add our handler in a delayed fashion so all the users handler are
+                // placed in front of the ServerBootstrapAcceptor.
+                ch.eventLoop().execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        pipeline.addLast(new ServerBootstrapAcceptor(
+                                currentChildGroup, currentChildHandler, currentChildOptions, currentChildAttrs));
+                    }
+                });
             }
         });
     }
@@ -275,7 +284,7 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
                 // stop accept new connections for 1 second to allow the channel to recover
                 // See https://github.com/netty/netty/issues/1328
                 config.setAutoRead(false);
-                ctx.channel().eventLoop().schedule(new OneTimeTask() {
+                ctx.channel().eventLoop().schedule(new Runnable() {
                     @Override
                     public void run() {
                        config.setAutoRead(true);

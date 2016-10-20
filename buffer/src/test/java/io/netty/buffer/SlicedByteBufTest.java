@@ -19,6 +19,7 @@ import org.junit.Test;
 
 import java.io.IOException;
 import java.util.Random;
+import java.nio.ByteBuffer;
 
 import static org.junit.Assert.*;
 
@@ -117,7 +118,25 @@ public class SlicedByteBufTest extends AbstractByteBufTest {
     @Test
     @Override
     public void testLittleEndianWithExpand() {
-       // ignore for SlicedByteBuf
+        // ignore for SlicedByteBuf
+    }
+
+    @Test
+    @Override
+    public void testReadBytes() {
+        // ignore for SlicedByteBuf
+    }
+
+    @Test
+    @Override
+    public void testForEachByteDesc2() {
+        // Ignore for SlicedByteBuf
+    }
+
+    @Test
+    @Override
+    public void testForEachByte2() {
+        // Ignore for SlicedByteBuf
     }
 
     @Test
@@ -165,5 +184,19 @@ public class SlicedByteBufTest extends AbstractByteBufTest {
         assertEquals(0, buffer.refCnt());
         assertEquals(0, slice1.refCnt());
         assertEquals(0, slice2.refCnt());
+    }
+
+    @Override
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testGetBytesByteBuffer() {
+        byte[] bytes = {'a', 'b', 'c', 'd', 'e', 'f', 'g'};
+        // Ensure destination buffer is bigger then what is wrapped in the ByteBuf.
+        ByteBuffer nioBuffer = ByteBuffer.allocate(bytes.length + 1);
+        ByteBuf wrappedBuffer = Unpooled.wrappedBuffer(bytes).slice(0, bytes.length - 1);
+        try {
+            wrappedBuffer.getBytes(wrappedBuffer.readerIndex(), nioBuffer);
+        } finally {
+            wrappedBuffer.release();
+        }
     }
 }

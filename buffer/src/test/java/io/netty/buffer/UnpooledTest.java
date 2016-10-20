@@ -482,7 +482,7 @@ public class UnpooledTest {
         assertFalse(buffer.isReadable());
 
         assertEquals(0, copyInt(null).capacity());
-        assertEquals(0, copyInt(EMPTY_INTS).capacity());
+        assertEquals(0, copyInt(new int[] {}).capacity());
     }
 
     @Test
@@ -502,7 +502,7 @@ public class UnpooledTest {
         assertFalse(buffer.isReadable());
 
         assertEquals(0, copyShort((short[]) null).capacity());
-        assertEquals(0, copyShort(EMPTY_SHORTS).capacity());
+        assertEquals(0, copyShort(new short[] {}).capacity());
     }
 
     @Test
@@ -514,7 +514,7 @@ public class UnpooledTest {
         assertFalse(buffer.isReadable());
 
         assertEquals(0, copyShort((int[]) null).capacity());
-        assertEquals(0, copyShort(EMPTY_INTS).capacity());
+        assertEquals(0, copyShort(new int[] {}).capacity());
     }
 
     @Test
@@ -534,7 +534,7 @@ public class UnpooledTest {
         assertFalse(buffer.isReadable());
 
         assertEquals(0, copyMedium(null).capacity());
-        assertEquals(0, copyMedium(EMPTY_INTS).capacity());
+        assertEquals(0, copyMedium(new int[] {}).capacity());
     }
 
     @Test
@@ -554,7 +554,7 @@ public class UnpooledTest {
         assertFalse(buffer.isReadable());
 
         assertEquals(0, copyLong(null).capacity());
-        assertEquals(0, copyLong(EMPTY_LONGS).capacity());
+        assertEquals(0, copyLong(new long[] {}).capacity());
     }
 
     @Test
@@ -574,7 +574,7 @@ public class UnpooledTest {
         assertFalse(buffer.isReadable());
 
         assertEquals(0, copyFloat(null).capacity());
-        assertEquals(0, copyFloat(EMPTY_FLOATS).capacity());
+        assertEquals(0, copyFloat(new float[] {}).capacity());
     }
 
     @Test
@@ -594,7 +594,7 @@ public class UnpooledTest {
         assertFalse(buffer.isReadable());
 
         assertEquals(0, copyDouble(null).capacity());
-        assertEquals(0, copyDouble(EMPTY_DOUBLES).capacity());
+        assertEquals(0, copyDouble(new double[] {}).capacity());
     }
 
     @Test
@@ -606,7 +606,7 @@ public class UnpooledTest {
         assertFalse(buffer.isReadable());
 
         assertEquals(0, copyBoolean(null).capacity());
-        assertEquals(0, copyBoolean(EMPTY_BOOLEANS).capacity());
+        assertEquals(0, copyBoolean(new boolean[] {}).capacity());
     }
 
     @Test
@@ -627,5 +627,49 @@ public class UnpooledTest {
     public void skipBytesNegativeLength() {
         ByteBuf buf = freeLater(buffer(8));
         buf.skipBytes(-1);
+    }
+
+    // See https://github.com/netty/netty/issues/5597
+    @Test
+    public void testWrapByteBufArrayStartsWithNonReadable() {
+        ByteBuf buffer1 = buffer(8);
+        ByteBuf buffer2 = buffer(8).writeZero(8); // Ensure the ByteBuf is readable.
+        ByteBuf buffer3 = buffer(8);
+        ByteBuf buffer4 = buffer(8).writeZero(8); // Ensure the ByteBuf is readable.
+
+        ByteBuf wrapped = wrappedBuffer(buffer1, buffer2, buffer3, buffer4);
+        assertEquals(16, wrapped.readableBytes());
+        assertTrue(wrapped.release());
+        assertEquals(0, buffer1.refCnt());
+        assertEquals(0, buffer2.refCnt());
+        assertEquals(0, buffer3.refCnt());
+        assertEquals(0, buffer4.refCnt());
+        assertEquals(0, wrapped.refCnt());
+    }
+
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testGetBytesByteBuffer() {
+        byte[] bytes = {'a', 'b', 'c', 'd', 'e', 'f', 'g'};
+        // Ensure destination buffer is bigger then what is wrapped in the ByteBuf.
+        ByteBuffer nioBuffer = ByteBuffer.allocate(bytes.length + 1);
+        ByteBuf wrappedBuffer = wrappedBuffer(bytes);
+        try {
+            wrappedBuffer.getBytes(wrappedBuffer.readerIndex(), nioBuffer);
+        } finally {
+            wrappedBuffer.release();
+        }
+    }
+
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testGetBytesByteBuffer2() {
+        byte[] bytes = {'a', 'b', 'c', 'd', 'e', 'f', 'g'};
+        // Ensure destination buffer is bigger then what is wrapped in the ByteBuf.
+        ByteBuffer nioBuffer = ByteBuffer.allocate(bytes.length + 1);
+        ByteBuf wrappedBuffer = wrappedBuffer(bytes, 0, bytes.length);
+        try {
+            wrappedBuffer.getBytes(wrappedBuffer.readerIndex(), nioBuffer);
+        } finally {
+            wrappedBuffer.release();
+        }
     }
 }

@@ -29,7 +29,7 @@ import io.netty.channel.socket.DefaultSocketChannelConfig;
 import io.netty.channel.socket.ServerSocketChannel;
 import io.netty.channel.socket.SocketChannelConfig;
 import io.netty.util.concurrent.GlobalEventExecutor;
-import io.netty.util.internal.OneTimeTask;
+import io.netty.util.internal.PlatformDependent;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -152,7 +152,7 @@ public class NioSocketChannel extends AbstractNioByteChannel implements io.netty
     public ChannelFuture shutdownOutput(final ChannelPromise promise) {
         Executor closeExecutor = ((NioSocketChannelUnsafe) unsafe()).prepareToClose();
         if (closeExecutor != null) {
-            closeExecutor.execute(new OneTimeTask() {
+            closeExecutor.execute(new Runnable() {
                 @Override
                 public void run() {
                     shutdownOutput0(promise);
@@ -163,7 +163,7 @@ public class NioSocketChannel extends AbstractNioByteChannel implements io.netty
             if (loop.inEventLoop()) {
                 shutdownOutput0(promise);
             } else {
-                loop.execute(new OneTimeTask() {
+                loop.execute(new Runnable() {
                     @Override
                     public void run() {
                         shutdownOutput0(promise);
@@ -176,10 +176,35 @@ public class NioSocketChannel extends AbstractNioByteChannel implements io.netty
 
     private void shutdownOutput0(final ChannelPromise promise) {
         try {
-            javaChannel().socket().shutdownOutput();
+            shutdownOutput0();
             promise.setSuccess();
         } catch (Throwable t) {
             promise.setFailure(t);
+        }
+    }
+
+    private void shutdownOutput0() throws Exception {
+        if (PlatformDependent.javaVersion() >= 7) {
+            javaChannel().shutdownOutput();
+        } else {
+            javaChannel().socket().shutdownOutput();
+        }
+    }
+
+    private void shutdownInput0(final ChannelPromise promise) {
+        try {
+            shutdownInput0();
+            promise.setSuccess();
+        } catch (Throwable t) {
+            promise.setFailure(t);
+        }
+    }
+
+    private void shutdownInput0() throws Exception {
+        if (PlatformDependent.javaVersion() >= 7) {
+            javaChannel().shutdownInput();
+        } else {
+            javaChannel().socket().shutdownInput();
         }
     }
 
@@ -195,13 +220,21 @@ public class NioSocketChannel extends AbstractNioByteChannel implements io.netty
 
     @Override
     protected void doBind(SocketAddress localAddress) throws Exception {
-        javaChannel().socket().bind(localAddress);
+        doBind0(localAddress);
+    }
+
+    private void doBind0(SocketAddress localAddress) throws Exception {
+        if (PlatformDependent.javaVersion() >= 7) {
+            javaChannel().bind(localAddress);
+        } else {
+            javaChannel().socket().bind(localAddress);
+        }
     }
 
     @Override
     protected boolean doConnect(SocketAddress remoteAddress, SocketAddress localAddress) throws Exception {
         if (localAddress != null) {
-            javaChannel().socket().bind(localAddress);
+            doBind0(localAddress);
         }
 
         boolean success = false;

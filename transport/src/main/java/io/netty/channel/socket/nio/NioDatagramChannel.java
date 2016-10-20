@@ -189,14 +189,22 @@ public final class NioDatagramChannel
 
     @Override
     protected void doBind(SocketAddress localAddress) throws Exception {
-        javaChannel().socket().bind(localAddress);
+        doBind0(localAddress);
+    }
+
+    private void doBind0(SocketAddress localAddress) throws Exception {
+        if (PlatformDependent.javaVersion() >= 7) {
+            javaChannel().bind(localAddress);
+        } else {
+            javaChannel().socket().bind(localAddress);
+        }
     }
 
     @Override
     protected boolean doConnect(SocketAddress remoteAddress,
             SocketAddress localAddress) throws Exception {
         if (localAddress != null) {
-            javaChannel().socket().bind(localAddress);
+            doBind0(localAddress);
         }
 
         boolean success = false;
@@ -585,5 +593,15 @@ public final class NioDatagramChannel
     @Override
     protected void setReadPending(boolean readPending) {
         super.setReadPending(readPending);
+    }
+
+    @Override
+    protected boolean closeOnReadError(Throwable cause) {
+        // We do not want to close on SocketException when using DatagramChannel as we usually can continue receiving.
+        // See https://github.com/netty/netty/issues/5893
+        if (cause instanceof SocketException) {
+            return false;
+        }
+        return super.closeOnReadError(cause);
     }
 }

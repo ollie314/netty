@@ -19,7 +19,9 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import sun.misc.Unsafe;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
@@ -40,6 +42,7 @@ final class PlatformDependent0 {
     static final Unsafe UNSAFE;
     private static final long ADDRESS_FIELD_OFFSET;
     private static final long BYTE_ARRAY_BASE_OFFSET;
+    private static final Constructor<?> DIRECT_BUFFER_CONSTRUCTOR;
 
     /**
      * Limits the number of bytes to copy per {@link Unsafe#copyMemory(long, long, long)} to allow safepoint polling
@@ -50,53 +53,98 @@ final class PlatformDependent0 {
     private static final boolean UNALIGNED;
 
     static {
-        ByteBuffer direct = ByteBuffer.allocateDirect(1);
-        Field addressField;
-        try {
-            addressField = Buffer.class.getDeclaredField("address");
-            addressField.setAccessible(true);
-            if (addressField.getLong(ByteBuffer.allocate(1)) != 0) {
-                // A heap buffer must have 0 address.
-                addressField = null;
-            } else {
-                if (addressField.getLong(direct) == 0) {
-                    // A direct buffer must have non-zero address.
-                    addressField = null;
+        final ByteBuffer direct = ByteBuffer.allocateDirect(1);
+        final Field addressField;
+        // attempt to access field Buffer#address
+        final Object maybeAddressField = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+            @Override
+            public Object run() {
+                try {
+                    final Field field = Buffer.class.getDeclaredField("address");
+                    field.setAccessible(true);
+                    // if direct really is a direct buffer, address will be non-zero
+                    if (field.getLong(direct) == 0) {
+                        return null;
+                    }
+                    return field;
+                } catch (IllegalAccessException e) {
+                    return e;
+                } catch (NoSuchFieldException e) {
+                    return e;
+                } catch (SecurityException e) {
+                    return e;
                 }
             }
-        } catch (Throwable t) {
-            // Failed to access the address field.
+        });
+
+        if (maybeAddressField instanceof Field) {
+            addressField = (Field) maybeAddressField;
+            logger.debug("java.nio.Buffer.address: available");
+        } else {
+            logger.debug("java.nio.Buffer.address: unavailable", (Exception) maybeAddressField);
             addressField = null;
         }
-        logger.debug("java.nio.Buffer.address: {}", addressField != null? "available" : "unavailable");
 
         Unsafe unsafe;
         if (addressField != null) {
-            try {
-                Field unsafeField = Unsafe.class.getDeclaredField("theUnsafe");
-                unsafeField.setAccessible(true);
-                unsafe = (Unsafe) unsafeField.get(null);
-                logger.debug("sun.misc.Unsafe.theUnsafe: {}", unsafe != null ? "available" : "unavailable");
-
-                // Ensure the unsafe supports all necessary methods to work around the mistake in the latest OpenJDK.
-                // https://github.com/netty/netty/issues/1061
-                // http://www.mail-archive.com/jdk6-dev@openjdk.java.net/msg00698.html
-                try {
-                    if (unsafe != null) {
-                        unsafe.getClass().getDeclaredMethod(
-                                "copyMemory", Object.class, long.class, Object.class, long.class, long.class);
-                        logger.debug("sun.misc.Unsafe.copyMemory: available");
+            // attempt to access field Unsafe#theUnsafe
+            final Object maybeUnsafe = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+                @Override
+                public Object run() {
+                    try {
+                        final Field unsafeField = Unsafe.class.getDeclaredField("theUnsafe");
+                        unsafeField.setAccessible(true);
+                        // the unsafe instance
+                        return unsafeField.get(null);
+                    } catch (NoSuchFieldException e) {
+                        return e;
+                    } catch (SecurityException e) {
+                        return e;
+                    } catch (IllegalAccessException e) {
+                        return e;
                     }
-                } catch (NoSuchMethodError t) {
-                    logger.debug("sun.misc.Unsafe.copyMemory: unavailable");
-                    throw t;
-                } catch (NoSuchMethodException e) {
-                    logger.debug("sun.misc.Unsafe.copyMemory: unavailable");
-                    throw e;
                 }
-            } catch (Throwable cause) {
-                // Unsafe.copyMemory(Object, long, Object, long, long) unavailable.
+            });
+
+            // the conditional check here can not be replaced with checking that maybeUnsafe
+            // is an instanceof Unsafe and reversing the if and else blocks; this is because an
+            // instanceof check against Unsafe will trigger a class load and we might not have
+            // the runtime permission accessClassInPackage.sun.misc
+            if (maybeUnsafe instanceof Exception) {
                 unsafe = null;
+                logger.debug("sun.misc.Unsafe.theUnsafe: unavailable", (Exception) maybeUnsafe);
+            } else {
+                unsafe = (Unsafe) maybeUnsafe;
+                logger.debug("sun.misc.Unsafe.theUnsafe: available");
+            }
+
+            // ensure the unsafe supports all necessary methods to work around the mistake in the latest OpenJDK
+            // https://github.com/netty/netty/issues/1061
+            // http://www.mail-archive.com/jdk6-dev@openjdk.java.net/msg00698.html
+            if (unsafe != null) {
+                final Unsafe finalUnsafe = unsafe;
+                final Object maybeException = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+                    @Override
+                    public Object run() {
+                        try {
+                            finalUnsafe.getClass().getDeclaredMethod(
+                                    "copyMemory", Object.class, long.class, Object.class, long.class, long.class);
+                            return null;
+                        } catch (NoSuchMethodException e) {
+                            return e;
+                        } catch (SecurityException e) {
+                            return e;
+                        }
+                    }
+                });
+
+                if (maybeException == null) {
+                    logger.debug("sun.misc.Unsafe.copyMemory: available");
+                } else {
+                    // Unsafe.copyMemory(Object, long, Object, long, long) unavailable.
+                    unsafe = null;
+                    logger.debug("sun.misc.Unsafe.copyMemory: unavailable", (Exception) maybeException);
+                }
             }
         } else {
             // If we cannot access the address of a direct buffer, there's no point of using unsafe.
@@ -110,25 +158,99 @@ final class PlatformDependent0 {
             BYTE_ARRAY_BASE_OFFSET = -1;
             ADDRESS_FIELD_OFFSET = -1;
             UNALIGNED = false;
+            DIRECT_BUFFER_CONSTRUCTOR = null;
         } else {
+            Constructor<?> directBufferConstructor;
+            long address = -1;
+            try {
+                final Object maybeDirectBufferConstructor =
+                        AccessController.doPrivileged(new PrivilegedAction<Object>() {
+                            @Override
+                            public Object run() {
+                                try {
+                                    final Constructor constructor =
+                                            direct.getClass().getDeclaredConstructor(long.class, int.class);
+                                    constructor.setAccessible(true);
+                                    return constructor;
+                                } catch (NoSuchMethodException e) {
+                                    return e;
+                                } catch (SecurityException e) {
+                                    return e;
+                                }
+                            }
+                        });
+
+                if (maybeDirectBufferConstructor instanceof Constructor<?>) {
+                    address = UNSAFE.allocateMemory(1);
+                    // try to use the constructor now
+                    try {
+                        ((Constructor) maybeDirectBufferConstructor).newInstance(address, 1);
+                        directBufferConstructor = (Constructor<?>) maybeDirectBufferConstructor;
+                        logger.debug("direct buffer constructor: available");
+                    } catch (InstantiationException e) {
+                        directBufferConstructor = null;
+                    } catch (IllegalAccessException e) {
+                        directBufferConstructor = null;
+                    } catch (InvocationTargetException e) {
+                        directBufferConstructor = null;
+                    }
+                } else {
+                    logger.debug(
+                            "direct buffer constructor: unavailable",
+                            (Exception) maybeDirectBufferConstructor);
+                    directBufferConstructor = null;
+                }
+            } finally {
+                if (address != -1) {
+                    UNSAFE.freeMemory(address);
+                }
+            }
+            DIRECT_BUFFER_CONSTRUCTOR = directBufferConstructor;
+
             ADDRESS_FIELD_OFFSET = objectFieldOffset(addressField);
             boolean unaligned;
-            try {
-                Class<?> bitsClass = Class.forName("java.nio.Bits", false, ClassLoader.getSystemClassLoader());
-                Method unalignedMethod = bitsClass.getDeclaredMethod("unaligned");
-                unalignedMethod.setAccessible(true);
-                unaligned = Boolean.TRUE.equals(unalignedMethod.invoke(null));
-            } catch (Throwable t) {
-                // We at least know x86 and x64 support unaligned access.
+            Object maybeUnaligned = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+                @Override
+                public Object run() {
+                    try {
+                        Class<?> bitsClass =
+                                Class.forName("java.nio.Bits", false, PlatformDependent.getSystemClassLoader());
+                        Method unalignedMethod = bitsClass.getDeclaredMethod("unaligned");
+                        unalignedMethod.setAccessible(true);
+                        return unalignedMethod.invoke(null);
+                    } catch (ClassNotFoundException e) {
+                        return e;
+                    } catch (NoSuchMethodException e) {
+                        return e;
+                    } catch (InvocationTargetException e) {
+                        return e;
+                    } catch (IllegalAccessException e) {
+                        return e;
+                    } catch (SecurityException e) {
+                        return e;
+                    }
+                }
+            });
+
+            if (maybeUnaligned instanceof Boolean) {
+                unaligned = (Boolean) maybeUnaligned;
+                logger.debug("java.nio.Bits.unaligned: available, {}", unaligned);
+            } else {
                 String arch = SystemPropertyUtil.get("os.arch", "");
                 //noinspection DynamicRegexReplaceableByCompiledPattern
                 unaligned = arch.matches("^(i[3-6]86|x86(_64)?|x64|amd64)$");
+                Exception e = (Exception) maybeUnaligned;
+                logger.debug("java.nio.Bits.unaligned: unavailable, " + unaligned, e);
             }
 
             UNALIGNED = unaligned;
-            logger.debug("java.nio.Bits.unaligned: {}", UNALIGNED);
             BYTE_ARRAY_BASE_OFFSET = arrayBaseOffset();
         }
+
+        logger.debug("java.nio.DirectByteBuffer.<init>(long, int): {}",
+                DIRECT_BUFFER_CONSTRUCTOR != null ? "available" : "unavailable");
+
+        freeDirectBuffer(direct);
     }
 
     static boolean isUnaligned() {
@@ -142,6 +264,33 @@ final class PlatformDependent0 {
     static void throwException(Throwable cause) {
         // JVM has been observed to crash when passing a null argument. See https://github.com/netty/netty/issues/4131.
         UNSAFE.throwException(checkNotNull(cause, "cause"));
+    }
+
+    static boolean hasDirectBufferNoCleanerConstructor() {
+        return DIRECT_BUFFER_CONSTRUCTOR != null;
+    }
+
+    static ByteBuffer reallocateDirectNoCleaner(ByteBuffer buffer, int capacity) {
+        return newDirectBuffer(UNSAFE.reallocateMemory(directBufferAddress(buffer), capacity), capacity);
+    }
+
+    static ByteBuffer allocateDirectNoCleaner(int capacity) {
+        return newDirectBuffer(UNSAFE.allocateMemory(capacity), capacity);
+    }
+
+    static ByteBuffer newDirectBuffer(long address, int capacity) {
+        ObjectUtil.checkPositiveOrZero(address, "address");
+        ObjectUtil.checkPositiveOrZero(capacity, "capacity");
+
+        try {
+            return (ByteBuffer) DIRECT_BUFFER_CONSTRUCTOR.newInstance(address, capacity);
+        } catch (Throwable cause) {
+            // Not expected to ever throw!
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            throw new Error(cause);
+        }
     }
 
     static void freeDirectBuffer(ByteBuffer buffer) {
@@ -266,6 +415,14 @@ final class PlatformDependent0 {
             srcOffset += size;
             dstOffset += size;
         }
+    }
+
+    static void setMemory(long address, long bytes, byte value) {
+        UNSAFE.setMemory(address, bytes, value);
+    }
+
+    static void setMemory(Object o, long offset, long bytes, byte value) {
+        UNSAFE.setMemory(o, offset, bytes, value);
     }
 
     static <U, W> AtomicReferenceFieldUpdater<U, W> newAtomicReferenceFieldUpdater(

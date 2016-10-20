@@ -20,7 +20,6 @@ import io.netty.buffer.ByteBufProcessor;
 import io.netty.handler.codec.haproxy.HAProxyProxiedProtocol.AddressFamily;
 import io.netty.util.CharsetUtil;
 import io.netty.util.NetUtil;
-import io.netty.util.internal.StringUtil;
 
 /**
  * Message container for decoded HAProxy proxy protocol parameters
@@ -183,6 +182,9 @@ public final class HAProxyMessage {
                 addressLen = addressEnd - startIdx;
             }
             dstAddress = header.toString(startIdx, addressLen, CharsetUtil.US_ASCII);
+            // AF_UNIX defines that exactly 108 bytes are reserved for the address. The previous methods
+            // did not increase the reader index although we already consumed the information.
+            header.readerIndex(startIdx + 108);
         } else {
             if (addressFamily == AddressFamily.AF_IPv4) {
                 // IPv4 requires 12 bytes for address information
@@ -227,7 +229,7 @@ public final class HAProxyMessage {
             throw new HAProxyProtocolException("header");
         }
 
-        String[] parts = StringUtil.split(header, ' ');
+        String[] parts = header.split(" ");
         int numParts = parts.length;
 
         if (numParts < 2) {

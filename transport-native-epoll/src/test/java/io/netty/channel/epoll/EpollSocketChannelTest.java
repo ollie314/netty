@@ -36,9 +36,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-
 public class EpollSocketChannelTest {
 
     @Test
@@ -129,7 +126,8 @@ public class EpollSocketChannelTest {
     }
 
     private void runExceptionHandleFeedbackLoop(EventLoopGroup group, Class<? extends ServerChannel> serverChannelClass,
-            Class<? extends Channel> channelClass, SocketAddress bindAddr) throws InterruptedException {
+                                                Class<? extends Channel> channelClass, SocketAddress bindAddr)
+            throws InterruptedException {
         Channel serverChannel = null;
         Channel clientChannel = null;
         try {
@@ -152,10 +150,10 @@ public class EpollSocketChannelTest {
             clientChannel.writeAndFlush(Unpooled.wrappedBuffer(new byte[1024]));
 
             // We expect to get 2 exceptions (1 from BuggyChannelHandler and 1 from ExceptionHandler).
-            assertTrue(serverInitializer.exceptionHandler.latch1.await(2, TimeUnit.SECONDS));
+            Assert.assertTrue(serverInitializer.exceptionHandler.latch1.await(2, TimeUnit.SECONDS));
 
             // After we get the first exception, we should get no more, this is expected to timeout.
-            assertFalse("Encountered " + serverInitializer.exceptionHandler.count.get() +
+            Assert.assertFalse("Encountered " + serverInitializer.exceptionHandler.count.get() +
                     " exceptions when 1 was expected",
                     serverInitializer.exceptionHandler.latch2.await(2, TimeUnit.SECONDS));
         } finally {
@@ -190,10 +188,9 @@ public class EpollSocketChannelTest {
     private static class ExceptionHandler extends ChannelInboundHandlerAdapter {
         final AtomicLong count = new AtomicLong();
         /**
-         * We expect to get 2 calls to {@link #exceptionCaught(ChannelHandlerContext, Throwable)}.
-         * 1 call from BuggyChannelHandler and 1 from closing the channel in this class.
+         * We expect to get 1 call to {@link #exceptionCaught(ChannelHandlerContext, Throwable)}.
          */
-        final CountDownLatch latch1 = new CountDownLatch(2);
+        final CountDownLatch latch1 = new CountDownLatch(1);
         final CountDownLatch latch2 = new CountDownLatch(1);
 
         @Override
@@ -203,7 +200,7 @@ public class EpollSocketChannelTest {
             } else {
                 latch2.countDown();
             }
-            // This is expected to throw an exception!
+            // This should not throw any exception.
             ctx.close();
         }
     }

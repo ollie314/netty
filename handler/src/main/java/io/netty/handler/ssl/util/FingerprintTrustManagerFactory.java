@@ -20,6 +20,7 @@ import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.util.internal.EmptyArrays;
 import io.netty.util.concurrent.FastThreadLocal;
+import io.netty.util.internal.InternalThreadLocalMap;
 
 import javax.net.ssl.ManagerFactoryParameters;
 import javax.net.ssl.TrustManager;
@@ -31,7 +32,6 @@ import java.security.NoSuchAlgorithmException;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.regex.Pattern;
@@ -39,11 +39,19 @@ import java.util.regex.Pattern;
 /**
  * An {@link TrustManagerFactory} that trusts an X.509 certificate whose SHA1 checksum matches.
  * <p>
- * <strong>NOTE:</strong>
- * Never use this {@link TrustManagerFactory} in production unless you are sure exactly what you are doing with it.
- * </p><p>
+ * <strong>NOTE:</strong> It is recommended to verify certificates and their chain to prevent
+ * <a href="https://en.wikipedia.org/wiki/Man-in-the-middle_attack">Man-in-the-middle attacks</a>.
+ * This {@link TrustManagerFactory} will <strong>only</strong> verify that the fingerprint of certificates match one
+ * of the given fingerprints. This procedure is called
+ * <a href="https://en.wikipedia.org/wiki/Transport_Layer_Security#Certificate_pinning">certificate pinning</a> and
+ * is an effective protection. For maximum security one should verify that the whole certificate chain is as expected.
+ * It is worth mentioning that certain firewalls, proxies or other appliances found in corporate environments,
+ * actually perform Man-in-the-middle attacks and thus present a different certificate fingerprint.
+ * </p>
+ * <p>
  * The SHA1 checksum of an X.509 certificate is calculated from its DER encoded format.  You can get the fingerprint of
  * an X.509 certificate using the {@code openssl} command.  For example:
+ *
  * <pre>
  * $ openssl x509 -fingerprint -sha1 -in my_certificate.crt
  * SHA1 Fingerprint=4E:85:10:55:BC:7B:12:08:D1:EA:0A:12:C9:72:EE:F3:AA:B2:C7:CB
@@ -151,7 +159,7 @@ public final class FingerprintTrustManagerFactory extends SimpleTrustManagerFact
             throw new NullPointerException("fingerprints");
         }
 
-        List<byte[]> list = new ArrayList<byte[]>();
+        List<byte[]> list = InternalThreadLocalMap.get().arrayList();
         for (byte[] f: fingerprints) {
             if (f == null) {
                 break;
@@ -171,7 +179,7 @@ public final class FingerprintTrustManagerFactory extends SimpleTrustManagerFact
             throw new NullPointerException("fingerprints");
         }
 
-        List<byte[]> list = new ArrayList<byte[]>();
+        List<byte[]> list = InternalThreadLocalMap.get().arrayList();
         for (String f: fingerprints) {
             if (f == null) {
                 break;

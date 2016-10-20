@@ -29,7 +29,6 @@ import io.netty.channel.EventLoopGroup;
 import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.GlobalEventExecutor;
-import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.StringUtil;
 
 import java.net.InetAddress;
@@ -295,8 +294,9 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
                         // Registration was successful, so set the correct executor to use.
                         // See https://github.com/netty/netty/issues/2586
                         promise.executor = channel.eventLoop();
+
+                        doBind0(regFuture, channel, localAddress, promise);
                     }
-                    doBind0(regFuture, channel, localAddress, promise);
                 }
             });
             return promise;
@@ -304,11 +304,15 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 
     final ChannelFuture initAndRegister() {
-        final Channel channel = channelFactory().newChannel();
+        Channel channel = null;
         try {
+            channel = channelFactory().newChannel();
             init(channel);
         } catch (Throwable t) {
-            channel.unsafe().closeForcibly();
+            if (channel != null) {
+                // channel can be null if newChannel crashed (eg SocketException("too many open files"))
+                channel.unsafe().closeForcibly();
+            }
             // as the Channel is not registered yet we need to force the usage of the GlobalEventExecutor
             return new DefaultChannelPromise(channel, GlobalEventExecutor.INSTANCE).setFailure(t);
         }
@@ -342,7 +346,7 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
 
         // This method is invoked before channelRegistered() is triggered.  Give user handlers a chance to set up
         // the pipeline in its channelRegistered() implementation.
-        channel.eventLoop().execute(new OneTimeTask() {
+        channel.eventLoop().execute(new Runnable() {
             @Override
             public void run() {
                 if (regFuture.isSuccess()) {

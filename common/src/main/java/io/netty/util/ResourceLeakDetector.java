@@ -34,7 +34,7 @@ import static io.netty.util.internal.StringUtil.EMPTY_STRING;
 import static io.netty.util.internal.StringUtil.NEWLINE;
 import static io.netty.util.internal.StringUtil.simpleClassName;
 
-public final class ResourceLeakDetector<T> {
+public class ResourceLeakDetector<T> {
 
     private static final String PROP_LEVEL_OLD = "io.netty.leakDetectionLevel";
     private static final String PROP_LEVEL = "io.netty.leakDetection.level";
@@ -109,7 +109,7 @@ public final class ResourceLeakDetector<T> {
     }
 
     // Should be power of two.
-    private static final int DEFAULT_SAMPLING_INTERVAL = 128;
+    static final int DEFAULT_SAMPLING_INTERVAL = 128;
 
     /**
      * @deprecated Use {@link #setLevel(Level)} instead.
@@ -159,31 +159,46 @@ public final class ResourceLeakDetector<T> {
 
     private long leakCheckCnt;
 
+    /**
+     * @deprecated use {@link ResourceLeakDetectorFactory#newResourceLeakDetector(Class, int, long)}.
+     */
+    @Deprecated
     public ResourceLeakDetector(Class<?> resourceType) {
         this(simpleClassName(resourceType));
     }
 
+    /**
+     * @deprecated use {@link ResourceLeakDetectorFactory#newResourceLeakDetector(Class, int, long)}.
+     */
+    @Deprecated
     public ResourceLeakDetector(String resourceType) {
         this(resourceType, DEFAULT_SAMPLING_INTERVAL, Long.MAX_VALUE);
     }
 
+    /**
+     * This should not be used directly by users of {@link ResourceLeakDetector}.
+     * Please use {@link ResourceLeakDetectorFactory#newResourceLeakDetector(Class)}
+     * or {@link ResourceLeakDetectorFactory#newResourceLeakDetector(Class, int, long)}
+     */
+    @SuppressWarnings("deprecation")
     public ResourceLeakDetector(Class<?> resourceType, int samplingInterval, long maxActive) {
         this(simpleClassName(resourceType), samplingInterval, maxActive);
     }
 
+    /**
+     * @deprecated use {@link ResourceLeakDetectorFactory#newResourceLeakDetector(Class, int, long)}.
+     */
+    @Deprecated
     public ResourceLeakDetector(String resourceType, int samplingInterval, long maxActive) {
         if (resourceType == null) {
             throw new NullPointerException("resourceType");
-        }
-        if (samplingInterval <= 0) {
-            throw new IllegalArgumentException("samplingInterval: " + samplingInterval + " (expected: 1+)");
         }
         if (maxActive <= 0) {
             throw new IllegalArgumentException("maxActive: " + maxActive + " (expected: 1+)");
         }
 
         this.resourceType = resourceType;
-        this.samplingInterval = MathUtil.findNextPositivePowerOfTwo(samplingInterval);
+        this.samplingInterval = MathUtil.safeFindNextPositivePowerOfTwo(samplingInterval);
         // samplingInterval is a power of two so we calculate a mask that we can use to
         // check if we need to do any leak detection or not.
         mask = this.samplingInterval - 1;
@@ -199,14 +214,14 @@ public final class ResourceLeakDetector<T> {
      *
      * @return the {@link ResourceLeak} or {@code null}
      */
-    public ResourceLeak open(T obj) {
+    public final ResourceLeak open(T obj) {
         Level level = ResourceLeakDetector.level;
         if (level == Level.DISABLED) {
             return null;
         }
 
         if (level.ordinal() < Level.PARANOID.ordinal()) {
-            if ((leakCheckCnt ++ & mask) == 0) {
+            if ((++ leakCheckCnt & mask) == 0) {
                 reportLeak(level);
                 return new DefaultResourceLeak(obj);
             } else {
@@ -234,9 +249,7 @@ public final class ResourceLeakDetector<T> {
         // Report too many instances.
         int samplingInterval = level == Level.PARANOID? 1 : this.samplingInterval;
         if (active * samplingInterval > maxActive && loggedTooManyActive.compareAndSet(false, true)) {
-            logger.error("LEAK: You are creating too many " + resourceType + " instances.  " +
-                    resourceType + " is a shared resource that must be reused across the JVM," +
-                    "so that only a few instances are created.");
+            reportInstancesLeak(resourceType);
         }
 
         // Detect and report previous leaks.
@@ -256,20 +269,46 @@ public final class ResourceLeakDetector<T> {
             String records = ref.toString();
             if (reportedLeaks.putIfAbsent(records, Boolean.TRUE) == null) {
                 if (records.isEmpty()) {
-                    logger.error("LEAK: {}.release() was not called before it's garbage-collected. " +
-                            "Enable advanced leak reporting to find out where the leak occurred. " +
-                            "To enable advanced leak reporting, " +
-                            "specify the JVM option '-D{}={}' or call {}.setLevel() " +
-                            "See http://netty.io/wiki/reference-counted-objects.html for more information.",
-                            resourceType, PROP_LEVEL, Level.ADVANCED.name().toLowerCase(), simpleClassName(this));
+                    reportUntracedLeak(resourceType);
                 } else {
-                    logger.error(
-                            "LEAK: {}.release() was not called before it's garbage-collected. " +
-                            "See http://netty.io/wiki/reference-counted-objects.html for more information.{}",
-                            resourceType, records);
+                    reportTracedLeak(resourceType, records);
                 }
             }
         }
+    }
+
+    /**
+     * This method is called when a traced leak is detected. It can be overridden for tracking how many times leaks
+     * have been detected.
+     */
+    protected void reportTracedLeak(String resourceType, String records) {
+        logger.error(
+                "LEAK: {}.release() was not called before it's garbage-collected. " +
+                "See http://netty.io/wiki/reference-counted-objects.html for more information.{}",
+                resourceType, records);
+    }
+
+    /**
+     * This method is called when an untraced leak is detected. It can be overridden for tracking how many times leaks
+     * have been detected.
+     */
+    protected void reportUntracedLeak(String resourceType) {
+        logger.error("LEAK: {}.release() was not called before it's garbage-collected. " +
+                "Enable advanced leak reporting to find out where the leak occurred. " +
+                "To enable advanced leak reporting, " +
+                "specify the JVM option '-D{}={}' or call {}.setLevel() " +
+                "See http://netty.io/wiki/reference-counted-objects.html for more information.",
+                resourceType, PROP_LEVEL, Level.ADVANCED.name().toLowerCase(), simpleClassName(this));
+    }
+
+    /**
+     * This method is called when instance leaks are detected. It can be overridden for tracking how many times leaks
+     * have been detected.
+     */
+    protected void reportInstancesLeak(String resourceType) {
+        logger.error("LEAK: You are creating too many " + resourceType + " instances.  " +
+                resourceType + " is a shared resource that must be reused across the JVM," +
+                "so that only a few instances are created.");
     }
 
     private final class DefaultResourceLeak extends PhantomReference<Object> implements ResourceLeak {

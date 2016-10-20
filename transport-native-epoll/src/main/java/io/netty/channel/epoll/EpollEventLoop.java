@@ -17,11 +17,15 @@ package io.netty.channel.epoll;
 
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.SelectStrategy;
 import io.netty.channel.SingleThreadEventLoop;
 import io.netty.channel.epoll.AbstractEpollChannel.AbstractEpollUnsafe;
 import io.netty.channel.unix.FileDescriptor;
+import io.netty.util.IntSupplier;
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
+import io.netty.util.concurrent.RejectedExecutionHandler;
+import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -31,6 +35,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Queue;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 /**
@@ -55,13 +60,29 @@ final class EpollEventLoop extends SingleThreadEventLoop {
     private final boolean allowGrowing;
     private final EpollEventArray events;
     private final IovArray iovArray = new IovArray();
+    private final SelectStrategy selectStrategy;
+    private final IntSupplier selectNowSupplier = new IntSupplier() {
+        @Override
+        public int get() throws Exception {
+            return Native.epollWait(epollFd.intValue(), events, 0);
+        }
+    };
+
+    private final Callable<Integer> pendingTasksCallable = new Callable<Integer>() {
+        @Override
+        public Integer call() throws Exception {
+            return EpollEventLoop.super.pendingTasks();
+        }
+    };
 
     @SuppressWarnings("unused")
     private volatile int wakenUp;
     private volatile int ioRatio = 50;
 
-    EpollEventLoop(EventLoopGroup parent, ThreadFactory threadFactory, int maxEvents) {
-        super(parent, threadFactory, false);
+    EpollEventLoop(EventLoopGroup parent, ThreadFactory threadFactory, int maxEvents,
+                   SelectStrategy strategy, RejectedExecutionHandler rejectedExecutionHandler) {
+        super(parent, threadFactory, false, DEFAULT_MAX_PENDING_TASKS, rejectedExecutionHandler);
+        selectStrategy = ObjectUtil.checkNotNull(strategy, "strategy");
         if (maxEvents == 0) {
             allowGrowing = true;
             events = new EpollEventArray(4096);
@@ -118,7 +139,7 @@ final class EpollEventLoop extends SingleThreadEventLoop {
     }
 
     /**
-     * Register the given epoll with this {@link io.netty.channel.EventLoop}.
+     * Register the given epoll with this {@link EventLoop}.
      */
     void add(AbstractEpollChannel ch) throws IOException {
         assert inEventLoop();
@@ -152,11 +173,22 @@ final class EpollEventLoop extends SingleThreadEventLoop {
     }
 
     @Override
-    protected Queue<Runnable> newTaskQueue() {
+    protected Queue<Runnable> newTaskQueue(int maxPendingTasks) {
         // This event loop never calls takeTask()
-        return PlatformDependent.newMpscQueue();
+        return PlatformDependent.newMpscQueue(maxPendingTasks);
     }
 
+    @Override
+    public int pendingTasks() {
+        // As we use a MpscQueue we need to ensure pendingTasks() is only executed from within the EventLoop as
+        // otherwise we may see unexpected behavior (as size() is only allowed to be called by a single consumer).
+        // See https://github.com/netty/netty/issues/5297
+        if (inEventLoop()) {
+            return super.pendingTasks();
+        } else {
+            return submit(pendingTasksCallable).syncUninterruptibly().getNow();
+        }
+    }
     /**
      * Returns the percentage of the desired amount of time spent for I/O in the event loop.
      */
@@ -191,6 +223,14 @@ final class EpollEventLoop extends SingleThreadEventLoop {
                 break;
             }
 
+            // If a task was submitted when wakenUp value was 1, the task didn't get a chance to produce wakeup event.
+            // So we need to check task queue again before calling epoll_wait. If we don't, the task might be pended
+            // until epoll_wait was timed out. It might be pended until idle timeout if IdleStateHandler existed
+            // in pipeline.
+            if (hasTasks() && WAKEN_UP_UPDATER.compareAndSet(this, 0, 1)) {
+                return Native.epollWait(epollFd.intValue(), events, 0);
+            }
+
             int selectedKeys = Native.epollWait(epollFd.intValue(), events, (int) timeoutMillis);
             selectCnt ++;
 
@@ -209,68 +249,81 @@ final class EpollEventLoop extends SingleThreadEventLoop {
     @Override
     protected void run() {
         for (;;) {
-            boolean oldWakenUp = WAKEN_UP_UPDATER.getAndSet(this, 0) == 1;
             try {
-                int ready;
-                if (hasTasks()) {
-                    // Non blocking just return what is ready directly without block
-                    ready = Native.epollWait(epollFd.intValue(), events, 0);
-                } else {
-                    ready = epollWait(oldWakenUp);
+                int strategy = selectStrategy.calculateStrategy(selectNowSupplier, hasTasks());
+                switch (strategy) {
+                    case SelectStrategy.CONTINUE:
+                        continue;
+                    case SelectStrategy.SELECT:
+                        strategy = epollWait(WAKEN_UP_UPDATER.getAndSet(this, 0) == 1);
 
-                    // 'wakenUp.compareAndSet(false, true)' is always evaluated
-                    // before calling 'selector.wakeup()' to reduce the wake-up
-                    // overhead. (Selector.wakeup() is an expensive operation.)
-                    //
-                    // However, there is a race condition in this approach.
-                    // The race condition is triggered when 'wakenUp' is set to
-                    // true too early.
-                    //
-                    // 'wakenUp' is set to true too early if:
-                    // 1) Selector is waken up between 'wakenUp.set(false)' and
-                    //    'selector.select(...)'. (BAD)
-                    // 2) Selector is waken up between 'selector.select(...)' and
-                    //    'if (wakenUp.get()) { ... }'. (OK)
-                    //
-                    // In the first case, 'wakenUp' is set to true and the
-                    // following 'selector.select(...)' will wake up immediately.
-                    // Until 'wakenUp' is set to false again in the next round,
-                    // 'wakenUp.compareAndSet(false, true)' will fail, and therefore
-                    // any attempt to wake up the Selector will fail, too, causing
-                    // the following 'selector.select(...)' call to block
-                    // unnecessarily.
-                    //
-                    // To fix this problem, we wake up the selector again if wakenUp
-                    // is true immediately after selector.select(...).
-                    // It is inefficient in that it wakes up the selector for both
-                    // the first case (BAD - wake-up required) and the second case
-                    // (OK - no wake-up required).
+                        // 'wakenUp.compareAndSet(false, true)' is always evaluated
+                        // before calling 'selector.wakeup()' to reduce the wake-up
+                        // overhead. (Selector.wakeup() is an expensive operation.)
+                        //
+                        // However, there is a race condition in this approach.
+                        // The race condition is triggered when 'wakenUp' is set to
+                        // true too early.
+                        //
+                        // 'wakenUp' is set to true too early if:
+                        // 1) Selector is waken up between 'wakenUp.set(false)' and
+                        //    'selector.select(...)'. (BAD)
+                        // 2) Selector is waken up between 'selector.select(...)' and
+                        //    'if (wakenUp.get()) { ... }'. (OK)
+                        //
+                        // In the first case, 'wakenUp' is set to true and the
+                        // following 'selector.select(...)' will wake up immediately.
+                        // Until 'wakenUp' is set to false again in the next round,
+                        // 'wakenUp.compareAndSet(false, true)' will fail, and therefore
+                        // any attempt to wake up the Selector will fail, too, causing
+                        // the following 'selector.select(...)' call to block
+                        // unnecessarily.
+                        //
+                        // To fix this problem, we wake up the selector again if wakenUp
+                        // is true immediately after selector.select(...).
+                        // It is inefficient in that it wakes up the selector for both
+                        // the first case (BAD - wake-up required) and the second case
+                        // (OK - no wake-up required).
 
-                    if (wakenUp == 1) {
-                        Native.eventFdWrite(eventFd.intValue(), 1L);
-                    }
+                        if (wakenUp == 1) {
+                            Native.eventFdWrite(eventFd.intValue(), 1L);
+                        }
+                    default:
+                        // fallthrough
                 }
 
                 final int ioRatio = this.ioRatio;
                 if (ioRatio == 100) {
-                    if (ready > 0) {
-                        processReady(events, ready);
+                    try {
+                        if (strategy > 0) {
+                            processReady(events, strategy);
+                        }
+                    } finally {
+                        // Ensure we always run tasks.
+                        runAllTasks();
                     }
-                    runAllTasks();
                 } else {
                     final long ioStartTime = System.nanoTime();
 
-                    if (ready > 0) {
-                        processReady(events, ready);
+                    try {
+                        if (strategy > 0) {
+                            processReady(events, strategy);
+                        }
+                    } finally {
+                        // Ensure we always run tasks.
+                        final long ioTime = System.nanoTime() - ioStartTime;
+                        runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
                     }
-
-                    final long ioTime = System.nanoTime() - ioStartTime;
-                    runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
                 }
-                if (allowGrowing && ready == events.length()) {
+                if (allowGrowing && strategy == events.length()) {
                     //increase the size of the array as we needed the whole space for the events
                     events.increase();
                 }
+            } catch (Throwable t) {
+                handleLoopException(t);
+            }
+            // Always handle shutdown even if the loop processing threw an exception.
+            try {
                 if (isShuttingDown()) {
                     closeAll();
                     if (confirmShutdown()) {
@@ -278,16 +331,20 @@ final class EpollEventLoop extends SingleThreadEventLoop {
                     }
                 }
             } catch (Throwable t) {
-                logger.warn("Unexpected exception in the selector loop.", t);
-
-                // Prevent possible consecutive immediate failures that lead to
-                // excessive CPU consumption.
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {
-                    // Ignore.
-                }
+                handleLoopException(t);
             }
+        }
+    }
+
+    private static void handleLoopException(Throwable t) {
+        logger.warn("Unexpected exception in the selector loop.", t);
+
+        // Prevent possible consecutive immediate failures that lead to
+        // excessive CPU consumption.
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+            // Ignore.
         }
     }
 

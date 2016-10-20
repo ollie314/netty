@@ -27,6 +27,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.ReadOnlyBufferException;
 import java.nio.channels.Channels;
 import java.nio.channels.GatheringByteChannel;
@@ -1227,6 +1228,7 @@ public abstract class AbstractByteBufTest {
             // Make sure if it is a copied buffer.
             actualValue.setByte(0, (byte) (actualValue.getByte(0) + 1));
             assertFalse(buffer.getByte(i) == actualValue.getByte(0));
+            actualValue.release();
         }
     }
 
@@ -1531,6 +1533,28 @@ public abstract class AbstractByteBufTest {
         assertTrue(buffer.compareTo(wrappedBuffer(value, 0, 31).order(LITTLE_ENDIAN)) > 0);
         assertTrue(buffer.slice(0, 31).compareTo(wrappedBuffer(value)) < 0);
         assertTrue(buffer.slice(0, 31).compareTo(wrappedBuffer(value).order(LITTLE_ENDIAN)) < 0);
+    }
+
+    @Test
+    public void testCompareTo2() {
+        byte[] bytes = {1, 2, 3, 4};
+        byte[] bytesReversed = {4, 3, 2, 1};
+
+        ByteBuf buf1 = newBuffer(4).clear().writeBytes(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuf buf2 = newBuffer(4).clear().writeBytes(bytesReversed).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuf buf3 = newBuffer(4).clear().writeBytes(bytes).order(ByteOrder.BIG_ENDIAN);
+        ByteBuf buf4 = newBuffer(4).clear().writeBytes(bytesReversed).order(ByteOrder.BIG_ENDIAN);
+        try {
+            assertEquals(buf1.compareTo(buf2), buf3.compareTo(buf4));
+            assertEquals(buf2.compareTo(buf1), buf4.compareTo(buf3));
+            assertEquals(buf1.compareTo(buf3), buf2.compareTo(buf4));
+            assertEquals(buf3.compareTo(buf1), buf4.compareTo(buf2));
+        } finally {
+            buf1.release();
+            buf2.release();
+            buf3.release();
+            buf4.release();
+        }
     }
 
     @Test
@@ -2521,6 +2545,81 @@ public abstract class AbstractByteBufTest {
             // expected
         }
         assertEquals(0, readOnlyDst.position());
+    }
+
+    @Test
+    public void testReadBytes() {
+        ByteBuf buffer = newBuffer(8);
+        byte[] bytes = new byte[8];
+        buffer.writeBytes(bytes);
+
+        ByteBuf buffer2 = buffer.readBytes(4);
+        assertSame(buffer.alloc(), buffer2.alloc());
+        assertEquals(4, buffer.readerIndex());
+        assertTrue(buffer.release());
+        assertEquals(0, buffer.refCnt());
+        assertTrue(buffer2.release());
+        assertEquals(0, buffer2.refCnt());
+    }
+
+    @Test
+    public void testForEachByteDesc2() {
+        byte[] expected = {1, 2, 3, 4};
+        ByteBuf buf = newBuffer(expected.length);
+        try {
+            buf.writeBytes(expected);
+            final byte[] bytes = new byte[expected.length];
+            int i = buf.forEachByteDesc(new ByteBufProcessor() {
+                private int index = bytes.length - 1;
+
+                @Override
+                public boolean process(byte value) throws Exception {
+                    bytes[index--] = value;
+                    return true;
+                }
+            });
+            assertEquals(-1, i);
+            assertArrayEquals(expected, bytes);
+        } finally {
+            buf.release();
+        }
+    }
+
+    @Test
+    public void testForEachByte2() {
+        byte[] expected = {1, 2, 3, 4};
+        ByteBuf buf = newBuffer(expected.length);
+        try {
+            buf.writeBytes(expected);
+            final byte[] bytes = new byte[expected.length];
+            int i = buf.forEachByte(new ByteBufProcessor() {
+                private int index;
+
+                @Override
+                public boolean process(byte value) throws Exception {
+                    bytes[index++] = value;
+                    return true;
+                }
+            });
+            assertEquals(-1, i);
+            assertArrayEquals(expected, bytes);
+        } finally {
+            buf.release();
+        }
+    }
+
+    @Test(expected = IndexOutOfBoundsException.class)
+    public void testGetBytesByteBuffer() {
+        byte[] bytes = {'a', 'b', 'c', 'd', 'e', 'f', 'g'};
+        // Ensure destination buffer is bigger then what is in the ByteBuf.
+        ByteBuffer nioBuffer = ByteBuffer.allocate(bytes.length + 1);
+        ByteBuf buffer = newBuffer(bytes.length);
+        try {
+            buffer.writeBytes(bytes);
+            buffer.getBytes(buffer.readerIndex(), nioBuffer);
+        } finally {
+            buffer.release();
+        }
     }
 
     private void testRefCnt0(final boolean parameter) throws Exception {

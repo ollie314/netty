@@ -34,6 +34,7 @@ final class UnsafeByteBufUtil {
 
     static final boolean BIG_ENDIAN_NATIVE_ORDER = ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
     private static final boolean UNALIGNED = PlatformDependent.isUnaligned();
+    private static final byte ZERO = 0;
 
     static byte getByte(long address) {
         return PlatformDependent.getByte(address);
@@ -252,6 +253,13 @@ final class UnsafeByteBufUtil {
         }
     }
 
+    static void setZero(byte[] array, int index, int length) {
+        if (length == 0) {
+            return;
+        }
+        PlatformDependent.setMemory(array, index, length, ZERO);
+    }
+
     static ByteBuf copy(AbstractByteBuf buf, long addr, int index, int length) {
         buf.checkIndex(index, length);
         ByteBuf copy = buf.alloc().directBuffer(length, buf.maxCapacity());
@@ -310,9 +318,8 @@ final class UnsafeByteBufUtil {
     }
 
     static void getBytes(AbstractByteBuf buf, long addr, int index, ByteBuffer dst) {
-        buf.checkIndex(index);
-        int bytesToCopy = Math.min(buf.capacity() - index, dst.remaining());
-        if (bytesToCopy == 0) {
+        buf.checkIndex(index, dst.remaining());
+        if (dst.remaining() == 0) {
             return;
         }
 
@@ -323,12 +330,12 @@ final class UnsafeByteBufUtil {
             }
             // Copy to direct memory
             long dstAddress = PlatformDependent.directBufferAddress(dst);
-            PlatformDependent.copyMemory(addr, dstAddress + dst.position(), bytesToCopy);
-            dst.position(dst.position() + bytesToCopy);
+            PlatformDependent.copyMemory(addr, dstAddress + dst.position(), dst.remaining());
+            dst.position(dst.position() + dst.remaining());
         } else if (dst.hasArray()) {
             // Copy to array
-            PlatformDependent.copyMemory(addr, dst.array(), dst.arrayOffset() + dst.position(), bytesToCopy);
-            dst.position(dst.position() + bytesToCopy);
+            PlatformDependent.copyMemory(addr, dst.array(), dst.arrayOffset() + dst.position(), dst.remaining());
+            dst.position(dst.position() + dst.remaining());
         } else  {
             dst.put(buf.nioBuffer());
         }
@@ -381,7 +388,7 @@ final class UnsafeByteBufUtil {
             try {
                 byte[] tmp = tmpBuf.array();
                 src.get(tmp, tmpBuf.arrayOffset(), length); // moves the src position too
-                PlatformDependent.copyMemory(tmp, 0, addr, length);
+                PlatformDependent.copyMemory(tmp, tmpBuf.arrayOffset(), addr, length);
             } finally {
                 tmpBuf.release();
             }
@@ -401,6 +408,23 @@ final class UnsafeByteBufUtil {
                 tmpBuf.release();
             }
         }
+    }
+
+    static void setZero(AbstractByteBuf buf, long addr, int index, int length) {
+        if (length == 0) {
+            return;
+        }
+
+        buf.checkIndex(index, length);
+        PlatformDependent.setMemory(addr, length, ZERO);
+    }
+
+    static UnpooledUnsafeDirectByteBuf newUnsafeDirectByteBuf(
+            ByteBufAllocator alloc, int initialCapacity, int maxCapacity) {
+        if (PlatformDependent.useDirectBufferNoCleaner()) {
+            return new UnpooledUnsafeNoCleanerDirectByteBuf(alloc, initialCapacity, maxCapacity);
+        }
+        return new UnpooledUnsafeDirectByteBuf(alloc, initialCapacity, maxCapacity);
     }
 
     private UnsafeByteBufUtil() { }

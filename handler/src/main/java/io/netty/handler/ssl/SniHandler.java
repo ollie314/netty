@@ -21,6 +21,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.util.CharsetUtil;
 import io.netty.util.DomainNameMapping;
+import io.netty.util.ReferenceCountUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -215,8 +216,12 @@ public class SniHandler extends ByteToMessageDecoder {
                                             final String hostname = in.toString(offset, serverNameLength,
                                                                                 CharsetUtil.UTF_8);
 
-                                            select(ctx, IDN.toASCII(hostname,
-                                                                    IDN.ALLOW_UNASSIGNED).toLowerCase(Locale.US));
+                                            try {
+                                                select(ctx, IDN.toASCII(hostname,
+                                                                        IDN.ALLOW_UNASSIGNED).toLowerCase(Locale.US));
+                                            } catch (Throwable t) {
+                                                ctx.fireExceptionCaught(t);
+                                            }
                                             return;
                                         } else {
                                             // invalid enum value
@@ -245,10 +250,22 @@ public class SniHandler extends ByteToMessageDecoder {
     }
 
     private void select(ChannelHandlerContext ctx, String hostname) {
+        SslHandler sslHandler = null;
         SslContext selectedContext = mapping.map(hostname);
         selection = new Selection(selectedContext, hostname);
-        SslHandler sslHandler = selectedContext.newHandler(ctx.alloc());
-        ctx.pipeline().replace(this, SslHandler.class.getName(), sslHandler);
+        try {
+            sslHandler = selection.context.newHandler(ctx.alloc());
+            ctx.pipeline().replace(this, SslHandler.class.getName(), sslHandler);
+        } catch (Throwable cause) {
+            selection = EMPTY_SELECTION;
+            // Since the SslHandler was not inserted into the pipeline the ownership of the SSLEngine was not
+            // transferred to the SslHandler.
+            // See https://github.com/netty/netty/issues/5678
+            if (sslHandler != null) {
+                ReferenceCountUtil.safeRelease(sslHandler.engine());
+            }
+            ctx.fireExceptionCaught(cause);
+        }
     }
 
     private static final class Selection {

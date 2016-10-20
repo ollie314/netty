@@ -51,7 +51,7 @@ import static io.netty.util.internal.ObjectUtil.*;
 /**
  * An {@link SslContext} which uses JDK's SSL/TLS implementation.
  */
-public abstract class JdkSslContext extends SslContext {
+public class JdkSslContext extends SslContext {
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(JdkSslContext.class);
 
@@ -100,6 +100,8 @@ public abstract class JdkSslContext extends SslContext {
                 SUPPORTED_CIPHERS, ciphers,
                 // XXX: Make sure to sync this list with OpenSslEngineFactory.
                 // GCM (Galois/Counter Mode) requires JDK 8.
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
                 "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
                 "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
                 // AES256 requires JCE unlimited strength jurisdiction policy files.
@@ -108,8 +110,7 @@ public abstract class JdkSslContext extends SslContext {
                 "TLS_RSA_WITH_AES_128_GCM_SHA256",
                 "TLS_RSA_WITH_AES_128_CBC_SHA",
                 // AES256 requires JCE unlimited strength jurisdiction policy files.
-                "TLS_RSA_WITH_AES_256_CBC_SHA",
-                "SSL_RSA_WITH_3DES_EDE_CBC_SHA");
+                "TLS_RSA_WITH_AES_256_CBC_SHA");
 
         if (ciphers.isEmpty()) {
             // Use the default from JDK as fallback.
@@ -140,20 +141,61 @@ public abstract class JdkSslContext extends SslContext {
     private final List<String> unmodifiableCipherSuites;
     private final JdkApplicationProtocolNegotiator apn;
     private final ClientAuth clientAuth;
+    private final SSLContext sslContext;
+    private final boolean isClient;
 
-    JdkSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter, JdkApplicationProtocolNegotiator apn,
-                  ClientAuth clientAuth) {
+    /**
+     * Creates a new {@link JdkSslContext} from a pre-configured {@link SSLContext}.
+     *
+     * @param sslContext the {@link SSLContext} to use.
+     * @param isClient {@code true} if this context should create {@link SSLEngine}s for client-side usage.
+     * @param clientAuth the {@link ClientAuth} to use. This will only be used when {@param isClient} is {@code false}.
+     */
+    public JdkSslContext(SSLContext sslContext, boolean isClient,
+                         ClientAuth clientAuth) {
+        this(sslContext, isClient, null, IdentityCipherSuiteFilter.INSTANCE,
+                JdkDefaultApplicationProtocolNegotiator.INSTANCE, clientAuth, false);
+    }
+
+    /**
+     * Creates a new {@link JdkSslContext} from a pre-configured {@link SSLContext}.
+     *
+     * @param sslContext the {@link SSLContext} to use.
+     * @param isClient {@code true} if this context should create {@link SSLEngine}s for client-side usage.
+     * @param ciphers the ciphers to use or {@code null} if the standart should be used.
+     * @param cipherFilter the filter to use.
+     * @param apn the {@link ApplicationProtocolConfig} to use.
+     * @param clientAuth the {@link ClientAuth} to use. This will only be used when {@param isClient} is {@code false}.
+     */
+    public JdkSslContext(SSLContext sslContext, boolean isClient, Iterable<String> ciphers,
+                         CipherSuiteFilter cipherFilter, ApplicationProtocolConfig apn,
+                         ClientAuth clientAuth) {
+        this(sslContext, isClient, ciphers, cipherFilter, toNegotiator(apn, !isClient), clientAuth, false);
+    }
+
+    JdkSslContext(SSLContext sslContext, boolean isClient, Iterable<String> ciphers, CipherSuiteFilter cipherFilter,
+                  JdkApplicationProtocolNegotiator apn, ClientAuth clientAuth, boolean startTls) {
+        super(startTls);
         this.apn = checkNotNull(apn, "apn");
         this.clientAuth = checkNotNull(clientAuth, "clientAuth");
         cipherSuites = checkNotNull(cipherFilter, "cipherFilter").filterCipherSuites(
                 ciphers, DEFAULT_CIPHERS, SUPPORTED_CIPHERS);
         unmodifiableCipherSuites = Collections.unmodifiableList(Arrays.asList(cipherSuites));
+        this.sslContext = checkNotNull(sslContext, "sslContext");
+        this.isClient = isClient;
     }
 
     /**
      * Returns the JDK {@link SSLContext} object held by this context.
      */
-    public abstract SSLContext context();
+    public final SSLContext context() {
+        return sslContext;
+    }
+
+    @Override
+    public final boolean isClient() {
+        return isClient;
+    }
 
     /**
      * Returns the JDK {@link SSLSessionContext} object held by this context.
@@ -210,7 +252,7 @@ public abstract class JdkSslContext extends SslContext {
     }
 
     @Override
-    public JdkApplicationProtocolNegotiator applicationProtocolNegotiator() {
+    public final JdkApplicationProtocolNegotiator applicationProtocolNegotiator() {
         return apn;
     }
 
@@ -301,17 +343,6 @@ public abstract class JdkSslContext extends SslContext {
         return buildKeyManagerFactory(certChainFile, algorithm, keyFile, keyPassword, kmf);
     }
 
-    static KeyManagerFactory buildKeyManagerFactory(X509Certificate[] certChain, PrivateKey key, String keyPassword,
-                                                              KeyManagerFactory kmf)
-            throws UnrecoverableKeyException, KeyStoreException, NoSuchAlgorithmException,
-                   CertificateException, IOException {
-        String algorithm = Security.getProperty("ssl.KeyManagerFactory.algorithm");
-        if (algorithm == null) {
-            algorithm = "SunX509";
-        }
-        return buildKeyManagerFactory(certChain, algorithm, key, keyPassword, kmf);
-    }
-
     /**
      * Build a {@link KeyManagerFactory} based upon a key algorithm, key file, key file password,
      * and a certificate chain.
@@ -334,21 +365,5 @@ public abstract class JdkSslContext extends SslContext {
                     CertificateException, KeyException, UnrecoverableKeyException {
         return buildKeyManagerFactory(toX509Certificates(certChainFile), keyAlgorithm,
                                       toPrivateKey(keyFile, keyPassword), keyPassword, kmf);
-    }
-
-    static KeyManagerFactory buildKeyManagerFactory(X509Certificate[] certChainFile,
-                                                              String keyAlgorithm, PrivateKey key,
-                                                              String keyPassword, KeyManagerFactory kmf)
-            throws KeyStoreException, NoSuchAlgorithmException, IOException,
-                   CertificateException, UnrecoverableKeyException {
-        char[] keyPasswordChars = keyPassword == null ? EmptyArrays.EMPTY_CHARS : keyPassword.toCharArray();
-        KeyStore ks = buildKeyStore(certChainFile, key, keyPasswordChars);
-        // Set up key manager factory to use our key store
-        if (kmf == null) {
-            kmf = KeyManagerFactory.getInstance(keyAlgorithm);
-        }
-        kmf.init(ks, keyPasswordChars);
-
-        return kmf;
     }
 }
